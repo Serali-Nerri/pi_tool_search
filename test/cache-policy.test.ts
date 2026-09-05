@@ -30,16 +30,38 @@ test("capabilities use declared resolved-model protocol flags, never model-name 
 	assert.equal(supportsIncrementalTools({ api: "openai-codex-responses", compat: { supportsAdditionalTools: true } }), true);
 	assert.equal(supportsIncrementalTools({ api: "openai-responses", compat: { supportsToolSearch: true } }), true);
 	assert.equal(supportsIncrementalTools({ api: "openai-responses", compat: { supportsToolSearch: "true" } }), false);
+	assert.equal(supportsIncrementalTools({ api: "anthropic-messages", compat: { supportsToolReferences: true } }), true);
+	assert.equal(supportsIncrementalTools({ api: "anthropic-messages" }), false);
+	assert.equal(supportsIncrementalTools({ api: "openai-responses", compat: { supportsToolReferences: true } }), false);
 });
 
 test("seven-tool and control defaults apply only to registered tools, including legacy exclusions", () => {
 	const catalog = new ToolCatalog();
-	const names = [...BASE_TOOL_NAMES, "tool_search", "contact_supervisor", "structured_output", "bg_wait"];
+	const names = [...BASE_TOOL_NAMES, "tool_search", "contact_supervisor", "structured_output"];
 	const tools = names.map((name) => tool(name));
 	catalog.refresh(tools, new Set(), new Map(tools.map((value) => [toolKey(value), "excluded"])));
 	assert.ok(catalog.all().every((value) => value.policy === "always" && value.protected));
 	catalog.refresh(tools.filter((value) => ["read", "grep", "tool_search"].includes(value.name)), new Set(), new Map());
 	assert.equal(catalog.byName("write"), undefined);
+});
+
+test("bg_wait defaults to deferred and accepts saved policies or an isolated role pin", () => {
+	const wait = tool("bg_wait", "npm:pi-subagents");
+	const catalog = new ToolCatalog();
+	catalog.refresh([wait], new Set(), new Map());
+	assert.equal(catalog.byName("bg_wait")?.policy, "deferred");
+	assert.equal(catalog.byName("bg_wait")?.protected, false);
+	for (const policy of ["always", "excluded", "deferred"] as const) {
+		catalog.refresh([wait], new Set(), new Map([[toolKey(wait), policy]]));
+		assert.equal(catalog.byName("bg_wait")?.policy, policy);
+	}
+	const pinned = new ToolCatalog();
+	pinned.refresh([wait], new Set(), new Map(), new Map(), new Set(["bg_wait"]));
+	assert.equal(pinned.byName("bg_wait")?.policy, "always");
+	assert.equal(pinned.byName("bg_wait")?.protected, true);
+	assert.equal(catalog.byName("bg_wait")?.policy, "deferred");
+	pinned.refresh([], new Set(), new Map(), new Map(), new Set(["bg_wait"]));
+	assert.equal(pinned.byName("bg_wait"), undefined);
 });
 
 test("npm and explicit child paths share identity, while distinct local providers do not", () => {

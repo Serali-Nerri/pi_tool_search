@@ -1,6 +1,6 @@
 # pi-tool-search
 
-Pi 的按需工具加载扩展，支持主会话和 `nicobailon/pi-subagents` 的独立子会话。保留稳定的工具目录和提示指南，按需向支持原生增量工具协议的模型提供完整工具定义。
+Pi 的按需工具加载扩展，支持主会话和 `nicobailon/pi-subagents` 的独立子会话。保留稳定的工具目录和提示指南，使用 Pi 的原生增量协议或通用 active-tools 回退按需提供完整工具定义。
 
 验证基线：Pi **0.85.0**、`pi-subagents` **0.65.1**、`@ff-labs/pi-fff` **0.10.6**、`pi-web-access` **0.28.0**。不需要修改这些已安装包的源码。
 
@@ -23,16 +23,29 @@ Pi 的按需工具加载扩展，支持主会话和 `nicobailon/pi-subagents` �
 策略分为 `always`、`deferred`、`excluded`：
 
 - `read`、`bash`、`edit`、`write`、`grep`、`find`、`ls` 默认锁定为 `always`。
-- `tool_search` 以及已获准注册的 `contact_supervisor`、`structured_output`、`bg_wait` 为协议控制工具；启用 deferred 时保持可用。固定展示模式不暴露 loader。
+- `tool_search` 以及已获准注册的 `contact_supervisor`、`structured_output` 为协议控制工具；启用 deferred 时保持可用。固定展示模式不暴露 loader。
+- `bg_wait` 默认 `deferred`，需要时通过 `tool_search` 激活；可显式设为 `always` 或 `excluded`。无需等待后台工作的会话不携带其完整定义。角色级常驻配置见下文。
 - 其他原本 active 的工具默认 `deferred`；原本 inactive 的工具及 `powershell` 默认 `excluded`，可通过策略调整。
 - 子代理只处理它的白名单内、实际已注册工具。七工具默认不会给 reviewer 补上 bash/edit/write，也不会加载未列入白名单的目标。
 - 旧配置中七类基本工具或上述控制工具的 `excluded/deferred` 值不再生效；它们在配置面板中显示为锁定的 `always`。其他工具的排除策略仍保留。工具选择不是操作系统权限沙箱。
 
 ## 模型和缓存边界
 
-默认 `mode: "auto"` 检查当前 **resolved model**，不猜模型名称。对于 `openai-responses` 或 `openai-codex-responses`，只有模型声明 `compat.supportsAdditionalTools: true` 或 `compat.supportsToolSearch: true` 时才启用原生延迟加载。
+默认 `mode: "auto"` 对所有模型按需激活工具，具体传输由 Pi 根据当前 **resolved model** 处理，不猜模型名称。两种延迟路径都只增添请求的工具，并在当前会话中保持已加载状态，不会每轮重新加载或自动卸载。
 
-未声明能力的端点采用 **eager：固定展示当前角色允许、且未被排除的工具**。自定义/无法识别的系统提示模板也采用此模式，原提示保持不变。可在配置中显式设 `mode: "eager"`；没有强行绕过能力检查的开关。
+`native` 和 `portable` 复用同一套 loader：模型调用 `tool_search`，扩展通过 `pi.setActiveTools()` 增添工具，Pi 在**下一次模型请求**中提供新定义。两条路径的激活时机和调用方式相同，差异在 Pi 的请求序列化方式及缓存特性。
+
+| 有效行为 | 初始工具定义 | 激活后的请求 | 缓存边界 |
+|---|---|---|---|
+| `auto` → `native` | 常驻工具和 loader | 原生协议引入新定义 | 可维持工具前缀稳定 |
+| `auto` → `portable` | 常驻工具和 loader | 普通 `tools` 列表增添完整定义 | 激活时列表变化，可能影响前缀缓存 |
+| 显式 `eager` | 全部允许且未排除的工具，不展示 loader | 固定允许工具集 | 从首轮携带全部定义 |
+
+表中的原生请求结构以已联测的 OpenAI Responses 路径为例：新定义放在 `input` 的原生加载结构中，初始顶层 `tools` 可保持不变；通用路径则扩大普通 `tools` 列表。其他提供者采用各自的原生表示。
+
+`native` / `portable` 是 `/tool-search status` 根据模型能力声明标识的预期传输路径，不是额外 JSON 配置值，也不是请求抓包结果；配置仍为 `"mode": "auto"` 或 `"mode": "eager"`。原生能力声明包括 OpenAI Responses 的 `compat.supportsAdditionalTools` / `compat.supportsToolSearch`，以及 `anthropic-messages` 的 `compat.supportsToolReferences`。无声明时状态标为 `portable`。这些标记只用于状态说明，最终协议选择由 Pi 的提供者适配器完成；本扩展不修改模型兼容标记或请求协议。
+
+自定义/无法识别的系统提示模板使用 **eager** 安全回退，原提示保持不变；需要延迟元数据时使用 Pi 默认提示并追加角色指令（`systemPromptMode: "append"`）。
 
 本机模型配置对应关系（保留原 model/thinking）：
 
@@ -40,11 +53,11 @@ Pi 的按需工具加载扩展，支持主会话和 `nicobailon/pi-subagents` �
 |---|---|---|
 | scout、delegate | `openai-codex/gpt-5.6-luna` | 原生延迟加载 |
 | oracle | `openai-codex/gpt-6-astra` | 原生延迟加载 |
-| worker、reviewer、researcher | `ark2/kimi-k3` | 固定展示允许工具 |
+| worker、reviewer、researcher | `ark2/kimi-k3` | 通用延迟加载 |
 
-GPT 的能力取自本机动态模型目录。当前 `ark2/kimi-k3` 没有声明这两个增量工具能力；仅使用 Responses API 不等于支持它们。本项目不修改 `models.json`，也不向未验证的端点强加兼容标记。角色换成支持的模型后，`auto` 会随模型能力调整。
+GPT 的能力取自本机动态模型目录。当前 `ark2/kimi-k3` 没有声明增量工具能力，仍可通过普通工具列表按需加载。角色切换模型时保留当前会话已加载的工具，不会因为变成通用路径就启用所有 deferred 工具；换模型本身不属于缓存稳定性保证。
 
-在工具目录、策略、模型和其他提示内容不变时，目标是保持顶层 tools、系统提示及既有内联工具定义的位置和内容稳定。实际注册/删除工具、schema 或指南更新、修改策略、换模型、切换模式、压缩历史等都是允许改变缓存前缀的边界。其他扩展直接改写系统提示或请求的行为也不在本扩展的稳定性保证内。
+在工具目录、策略、模型和其他提示内容不变时，两种延迟路径都保持 manifest 和系统工具指南稳定。原生路径还以保持顶层 tools 及既有内联工具定义的位置和内容稳定为目标；通用路径允许顶层 tools 在首次激活时扩大，重复加载同一工具不会重复增加定义。实际注册/删除工具、schema 或指南更新、修改策略、换模型、切换模式、压缩历史等都是允许改变缓存前缀的边界。其他扩展直接改写系统提示或请求的行为也不在本扩展的稳定性保证内。
 
 请求结构稳定只是缓存的客户端条件，**不保证服务端真实命中**。真实收益应检查正常模型响应的缓存用量，例如 Pi 的 `usage.cacheRead`。
 
@@ -122,9 +135,32 @@ RTK 在有 bash 的四个角色启动时加载，通过 `tool_call` 钩子调用
 - reviewer：审阅文档、核对原文和页面证据。
 - delegate：处理包括文档输入在内的通用委托任务。
 
-这些工具的全局策略为 deferred。当前 delegate 使用支持原生增量工具的 GPT，因此按需加载；reviewer/researcher 使用未声明增量能力的 Kimi，`auto` 会固定展示允许工具。换成支持的模型后自动采用延迟加载。
+这些工具的全局策略为 deferred。delegate 使用原生延迟路径，reviewer/researcher 使用通用延迟路径；三个角色初始均不展示文档工具的完整定义。请求 `document_parse` 后仅激活该工具，未请求的 `document_search` / `document_screenshot` 保持隐藏。
 
 scout、worker、oracle 没有加载 Docparser，其 manifest 不会因为全局策略中有文档工具记录就出现这些工具。联测覆盖了未加载提供者时的未知名称拒绝，以及实际单页 PDF 解析。扩展路径加载不等于加载其附带 skill；此配置不改变角色的 skills 设置。
+
+### 子代理状态与 bg_wait 角色级常驻
+
+前台和后台 child 使用同样的加载规则：只处理各自白名单内、已注册的工具；每个 fresh child 独立维护 loaded 集合，主代理或其他 child 的激活不会传播过去。恢复已有 child 会话时从成功加载记录恢复。加载扩展不等于提前暴露全部工具定义，也不等于开启嵌套调度。
+
+当前六个角色的 `tools` 都未包含 `bg_wait`，因此它默认不会进入可用工具目录或展示给模型；本次行为不要求更改这些角色的 `tools` 或 `extensions`。普通子代理的原生完成通知和无界面结束阶段的自动等待仍由 pi-subagents 负责。
+
+若某个角色确实需要 `bg_wait`：
+
+1. 在 `~/.pi/agent/settings.json` 的 `subagents.agentOverrides.<角色>.tools` 原列表中加入 `"bg_wait"`。Pi-subagents 的 child runtime 提供该工具，不必把整个父代理调度扩展加入 child。
+2. 需要按需等待时，继续使用默认 `.../pi-tool-search/index.ts`。
+3. 需要从首轮常驻时，仅对该角色将默认入口**替换**为 `.../pi-tool-search/profiles/bg-wait-always.ts`，不要同时加载两个入口。其他扩展和工具白名单保留。
+
+本机角色入口替换示例：
+
+```text
+/home/thelya/.pi/agent/extensions/pi-tool-search/index.ts
+→ /home/thelya/.pi/agent/extensions/pi-tool-search/profiles/bg-wait-always.ts
+```
+
+该可选 profile 在当前实例内将已注册的 `bg_wait` 锁定为 `always`，不读写全局角色状态，不影响其他角色，也不能绕过白名单或加载缺失提供者。需要解除固定时换回默认入口；默认入口下仍支持普通 JSON 工具策略或 `/tool-search config`。若在全局 JSON 中直接把 `bg_wait` 设为 `always`，则会影响所有允许该工具的会话，而不只是某个角色。
+
+自定义角色 profile 可调用导出的 `registerToolSearch(pi, cwd, entryPath, { alwaysTools: ["bg_wait"] })`；`entryPath` 必须是该入口的实际路径。`npm run configure:subagents` 会恢复六角色示例的默认入口，使用可选 profile 后不要无检查地重跑配置脚本。
 
 ## FFF 全局配置
 
@@ -158,7 +194,7 @@ scout、worker、oracle 没有加载 Docparser，其 manifest 不会因为全局
 }
 ```
 
-优先级为：受信任项目的 `<ctx.cwd>/.pi/pi-tool-search.json` > 全局配置 > 默认策略；基本/协议控制工具的锁定规则最后生效。未受信任项目不读取项目策略。设置 `PI_CODING_AGENT_DIR` 的 Pi 使用其指定 agent 目录。
+优先级为：受信任项目的 `<ctx.cwd>/.pi/pi-tool-search.json` > 全局配置 > 默认策略；基本/协议控制工具及显式角色 profile 的锁定规则最后生效。未受信任项目不读取项目策略。设置 `PI_CODING_AGENT_DIR` 的 Pi 使用其指定 agent 目录。
 
 主会话中的 npm 来源和 child 显式路径产生的 `source: "cli"` 会规范化到同一 npm 提供者身份；新的策略保存规范化身份，旧 source 标签仍可读取。全局策略不能使缺少提供者扩展、或不在 child 白名单内的工具凭空可用。
 
@@ -176,9 +212,11 @@ scout、worker、oracle 没有加载 Docparser，其 manifest 不会因为全局
 /tool-search audit off
 ```
 
-`on` 启用能力感知模式；不支持的模型仍显示 `eager` 及原因。`off` 固定恢复允许的 deferred 工具、隐藏 loader，`excluded` 工具仍不启用。非空闲时拒绝修改工具策略。
+`on` 重新启用配置的加载策略并清空当前 loaded 集合；`auto` 下显示 `native` 或 `portable`，显式 `eager` 仍保持固定展示。`off` 固定恢复允许的 deferred 工具、隐藏 loader，`excluded` 工具仍不启用。非空闲时拒绝修改工具策略。
 
 审计默认关闭。开启后，在 `before_provider_request` 检查顶层工具、系统内容、既有内联工具定义及其位置，向 stderr 输出序号和 hash，不输出提示原文、工具结果或凭据；`audit status` 显示本会话最新结果。也可设置 `PI_TOOL_SEARCH_AUDIT=1` 或配置中的 `audit: true`，后者在 reload/新会话读取。
+
+通用延迟首次激活工具时，审计出现 `top-level tools changed` 是预期行为；随后没有新激活时应再次稳定。系统指南稳定不能抵消普通工具列表变化的缓存影响。当前审计 payload 解析面向 Responses 请求；不支持的格式会显示 `unsupported payload`。
 
 审计不发送额外模型请求、不启动子代理、不重复加载扩展。开启时会扫描请求的相关部分并计算 hash；关闭时不读取请求 payload。正常运行仍需要工具目录检查和历史消息引用遍历，不应理解为零 CPU 成本。每个 fresh child 本来就要初始化其显式扩展，tool-search 延迟的是**模型可见 schema**，不是扩展模块或 FFF 索引的初始化。
 
@@ -194,8 +232,8 @@ npm run verify
 npm run test:subagents
 ```
 
-- `verify`：严格 TypeScript 检查及 50 项单元/集成测试。
-- `test:subagents`：实际 Pi child factory + 实际 FFF/Web/RTK/Docparser 扩展 + 本机 Responses SSE 服务。28 个场景、153 次 mock 请求、364 项断言，另检查六角色的 12 个前台/后台启动计划、8 个扩展加载策略计划，以及发现的全部角色的扩展选择。RTK 验证调用实际 `rtk rewrite`，末端 bash 使用记录命令的测试桩。Docparser 使用本地生成的单页 PDF、关闭 OCR，不需要外网或真实模型请求。
+- `verify`：严格 TypeScript 检查及 57 项单元/集成测试。
+- `test:subagents`：实际 Pi child factory + 实际 FFF/Web/RTK/Docparser 扩展 + 本机 Responses / Chat Completions SSE 服务。44 个场景、236 次 mock 请求、695 项结果断言，另检查六角色的 12 个前台/后台启动计划、8 个扩展加载策略计划、2 个角色常驻入口计划，以及发现的全部角色的扩展选择。覆盖通用加载、重复激活、恢复、显式 eager、bg_wait 按需/角色常驻及六个并发 child 的状态隔离；mock 还拒绝调用请求中没有定义或尚未激活的工具。RTK 验证调用实际 `rtk rewrite`，末端 bash 使用记录命令的测试桩。Docparser 使用本地生成的单页 PDF、关闭 OCR，不需要外网或真实模型请求。
 - 请求联测需本机已安装对应包和 RTK；其他机器可设置 `PROBE_PI_ROOT`、`PROBE_SUBAGENTS_ROOT`、`PROBE_FFF_ROOT`、`PROBE_WEB_ROOT`、`PROBE_RTK_ENTRY`、`PROBE_DOCPARSER_ROOT`，或用 `PROBE_TOOL_SEARCH_ENTRY` 指向待验证部署。脚本输出 `/tmp/pi-subagents-tool-search-*/report.json` 和逐场景请求记录。
 - 开发依赖包含 `@earendil-works/pi-server@0.85.0`，用于 Pi 0.85 顶层 SDK 导出的直接 Node 导入；不会部署它或修改全局 npm 包。
 
@@ -228,6 +266,7 @@ src/audit.ts           默认关闭的请求结构审计
 src/tool.ts            精确名称 loader 和紧凑渲染
 src/manifest.ts        manifest 与短描述预算
 src/ui.ts              项目策略配置面板
+src/profiles/          按角色选择的可选入口，如 bg-wait-always.ts
 test/                  单元、集成、配置及部署测试
 scripts/               部署、配置合并、真实 child 请求联测
 ```

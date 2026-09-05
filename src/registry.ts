@@ -20,7 +20,7 @@ export interface ToolCatalogEntry {
 export const TOOL_SEARCH_NAME = "tool_search";
 export const BASE_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
 export const PROTECTED_TOOL_NAMES = new Set<string>([
-	...BASE_TOOL_NAMES, TOOL_SEARCH_NAME, "contact_supervisor", "structured_output", "bg_wait",
+	...BASE_TOOL_NAMES, TOOL_SEARCH_NAME, "contact_supervisor", "structured_output",
 ]);
 export const DEFAULT_EXCLUDED_TOOL_NAMES = new Set(["powershell"]);
 
@@ -58,6 +58,7 @@ export function policyRecordKey(record: Pick<ToolPolicyRecord, "name" | "source"
 function defaultPolicy(tool: ToolInfo, initiallyActive: ReadonlySet<string>): ToolPolicy {
 	if (PROTECTED_TOOL_NAMES.has(tool.name)) return "always";
 	if (DEFAULT_EXCLUDED_TOOL_NAMES.has(tool.name)) return "excluded";
+	if (tool.name === "bg_wait") return "deferred";
 	return initiallyActive.has(tool.name) ? "deferred" : "excluded";
 }
 
@@ -74,12 +75,13 @@ export class ToolCatalog {
 		initiallyActive: ReadonlySet<string>,
 		savedPolicies: ReadonlyMap<string, ToolPolicy>,
 		projectPolicies: ReadonlyMap<string, ToolPolicy> = new Map(),
+		alwaysTools: ReadonlySet<string> = new Set(),
 	): boolean {
 		const previous = this.signature;
 		const next = new Map<string, ToolCatalogEntry>();
 		for (const tool of tools) {
 			const key = toolKey(tool);
-			const protectedTool = PROTECTED_TOOL_NAMES.has(tool.name);
+			const protectedTool = PROTECTED_TOOL_NAMES.has(tool.name) || alwaysTools.has(tool.name);
 			const existing = this.entriesByKey.get(key);
 			// Legacy source labels (notably "cli") remain readable. New saves use
 			// canonical provider identities shared by parent and explicit child loads.

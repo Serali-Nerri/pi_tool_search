@@ -20,6 +20,7 @@ const rtkPath = process.env.PROBE_RTK_ENTRY ?? "/home/thelya/.pi/agent/extension
 const docparserRoot = process.env.PROBE_DOCPARSER_ROOT ?? "/home/thelya/.pi/agent/npm/node_modules/pi-docparser";
 const documentTools = ["document_parse", "document_search", "document_screenshot"];
 const extensionPath = process.env.PROBE_TOOL_SEARCH_ENTRY ?? join(projectRoot, "src/index.ts");
+const waitProfilePath = join(dirname(extensionPath), "profiles/bg-wait-always.ts");
 const example = JSON.parse(await readFile(join(projectRoot, "docs/subagents-settings.example.json"), "utf8"));
 const roleOverrides = example.subagents.agentOverrides;
 function resolveRoleExtension(path: string): string {
@@ -92,6 +93,7 @@ type Action = { name: string; args?: Record<string, unknown> } | { text: string 
 type Scenario = {
 	name: string;
 	mode?: "additional" | "search" | "fallback";
+	chatCompletions?: boolean;
 	actions?: Action[];
 	tools?: string[];
 	fff?: boolean;
@@ -104,6 +106,8 @@ type Scenario = {
 	inheritTools?: boolean;
 	codex?: boolean;
 	supervisor?: boolean;
+	eager?: boolean;
+	waitProfile?: boolean;
 };
 type Captured = { body: any; active: string[]; systemPrompt: string; catalog: any[] };
 const requests = new Map<string, Captured[]>();
@@ -120,13 +124,30 @@ const server = createServer(async (request, response) => {
 		const bytes = Buffer.concat(chunks);
 		const body = JSON.parse((request.headers["content-encoding"] === "zstd" ? zstdDecompressSync(bytes) : bytes).toString());
 		assert.equal(request.method, "POST");
-		assert.ok(["/v1/responses", "/v1/codex/responses"].includes(request.url ?? ""));
+		assert.ok(["/v1/responses", "/v1/codex/responses", "/v1/chat/completions"].includes(request.url ?? ""));
 		const snapshot = pendingSnapshots.get(body.model)?.shift();
 		assert.ok(snapshot, `Missing request observation for ${body.model}`);
 		requests.get(body.model)!.push({ body, ...snapshot });
 		const action = sequences.get(body.model)?.shift();
 		assert.ok(action, `Unexpected model request for ${body.model}`);
+		if ("name" in action) {
+			assert.ok(snapshot.active.includes(action.name), `Script requested inactive tool ${action.name} in ${body.model}`);
+			const definitions = [...(body.tools ?? []), ...inlineDefinitions(body)];
+			assert.ok(JSON.stringify(definitions).includes(`"name":"${action.name}"`), `Missing wire definition for ${action.name} in ${body.model}`);
+		}
 		const serial = ++responseCounter;
+		if (request.url === "/v1/chat/completions") {
+			response.writeHead(200, { "content-type": "text/event-stream" });
+			const delta = "name" in action
+				? { role: "assistant", tool_calls: [{ index: 0, id: `call_${serial}`, type: "function", function: { name: action.name, arguments: JSON.stringify(action.args ?? {}) } }] }
+				: { role: "assistant", content: action.text };
+			for (const chunk of [
+				{ choices: [{ index: 0, delta, finish_reason: null }] },
+				{ choices: [{ index: 0, delta: {}, finish_reason: "name" in action ? "tool_calls" : "stop" }], usage: { prompt_tokens: 1200, completion_tokens: 10, total_tokens: 1210 } },
+			]) response.write(`data: ${JSON.stringify({ id: `chatcmpl_${serial}`, object: "chat.completion.chunk", created: 0, model: body.model, ...chunk })}\n\n`);
+			response.end("data: [DONE]\n\n");
+			return;
+		}
 		const item = "name" in action
 			? { type: "function_call", id: `fc_${serial}`, call_id: `call_${serial}`, name: action.name, arguments: JSON.stringify(action.args ?? {}), status: "completed" }
 			: { type: "message", id: `msg_${serial}`, role: "assistant", status: "completed", content: [{ type: "output_text", text: action.text, annotations: [] }] };
@@ -169,6 +190,26 @@ const cases: Scenario[] = [
 	{ name: "native-metadata" },
 	{ name: "late-registration", lateRegistration: true, tools: [...permittedTools, "probe_gamma"] },
 	{ name: "non-native", mode: "fallback" },
+	{ name: "portable-resume", mode: "fallback", resume: true },
+	{ name: "portable-chat", mode: "fallback", chatCompletions: true },
+	{ name: "portable-chat-resume", mode: "fallback", chatCompletions: true, resume: true },
+	{ name: "eager-chat", mode: "fallback", chatCompletions: true, eager: true },
+	{ name: "portable-late-registration", mode: "fallback", lateRegistration: true, tools: [...permittedTools, "probe_gamma"] },
+	{ name: "portable-fff", mode: "fallback", fff: true, sevenPolicy: true },
+	{ name: "explicit-eager", eager: true },
+	{ name: "portable-explicit-eager", mode: "fallback", eager: true },
+	{ name: "portable-replace-prompt", mode: "fallback", replacePrompt: true },
+	{ name: "bg-wait-deferred", mode: "fallback", tools: [...permittedTools, "bg_wait"], actions: [
+		{ name: "tool_search", args: { tool_names: ["bg_wait"] } },
+		{ name: "bg_wait" },
+		{ name: "tool_search", args: { tool_names: ["bg_wait"] } },
+		{ text: "wait loaded once" },
+	] },
+	{ name: "bg-wait-native", tools: [...permittedTools, "bg_wait"], actions: [
+		{ name: "tool_search", args: { tool_names: ["bg_wait"] } },
+		{ name: "bg_wait" }, { text: "native wait loaded" },
+	] },
+	{ name: "wait-profile-missing-tool", waitProfile: true, tools: permittedTools, actions: [{ text: "role pin cannot grant a tool" }] },
 	{ name: "allowlist-missing-target", tools: [...baseTools, "tool_search", "probe_beta"], actions: [{ name: "tool_search", args: { tool_names: ["probe_alpha"] } }, { text: "done" }] },
 	{ name: "allowlist-missing-loader", tools: baseTools, actions: [{ text: "done" }] },
 	{ name: "docparser-unloaded", actions: [{ name: "tool_search", args: { tool_names: documentTools } }, { text: "missing provider remains unavailable" }] },
@@ -184,8 +225,8 @@ const cases: Scenario[] = [
 		codex: ["scout", "delegate", "oracle"].includes(role),
 		fff: role !== "researcher", supervisor: roleOverrides[role].tools.includes("contact_supervisor"),
 		actions: [
-			...(["scout", "delegate", "oracle"].includes(role) ? [{ name: "tool_search", args: { tool_names: ["web_search"] } }] : []),
-			...(role === "delegate" ? [{ name: "tool_search", args: { tool_names: ["document_parse"] } }] : []),
+			{ name: "tool_search", args: { tool_names: ["web_search"] } },
+			...(roleOverrides[role].tools.includes("document_parse") ? [{ name: "tool_search", args: { tool_names: ["document_parse"] } }] : []),
 			...(roleOverrides[role].tools.includes("bash") ? [{ name: "bash", args: { command: "git status --short" } }] : []),
 			...(roleOverrides[role].tools.includes("document_parse") ? [{ name: "document_parse", args: { path: "fixture.pdf", targetPages: "1", ocr: "off" } }] : []),
 			{ text: "configured role complete without external web requests" },
@@ -198,10 +239,14 @@ const cases: Scenario[] = [
 	] },
 	{ name: "concurrent-loader" },
 	{ name: "concurrent-idle", actions: [{ text: "independent child complete" }] },
+	{ name: "concurrent-portable-loader", mode: "fallback" },
+	{ name: "concurrent-portable-idle", mode: "fallback", actions: [{ text: "portable child stayed idle" }] },
+	{ name: "concurrent-wait-pinned", waitProfile: true, tools: [...permittedTools, "bg_wait"], actions: [{ name: "bg_wait" }, { text: "role pin active" }] },
+	{ name: "concurrent-wait-idle", mode: "fallback", tools: [...permittedTools, "bg_wait"], actions: [{ text: "default wait remains deferred" }] },
 ];
 const models = cases.map((scenario) => ({
 	id: scenario.name, name: scenario.name, reasoning: false, input: ["text"],
-	api: scenario.codex ? "openai-codex-responses" : "openai-responses",
+	api: scenario.chatCompletions ? "openai-completions" : scenario.codex ? "openai-codex-responses" : "openai-responses",
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 2000,
 	compat: {
 		supportsAdditionalTools: (scenario.mode ?? "additional") === "additional",
@@ -244,6 +289,25 @@ async function inspectConfigurationPlans(): Promise<any> {
 			plans.push({ role: name, host, tools: launch.session.tools, extensionPaths: launch.session.extensionPaths, ambientExtensions: launch.session.ambientExtensions, promptMode: agent.systemPromptMode });
 		}
 	}
+	const profileCwd = join(probeRoot, "wait-role-profile");
+	await mkdir(join(profileCwd, ".pi"), { recursive: true });
+	const waitRole = {
+		...overrides.worker,
+		tools: [...overrides.worker.tools, "bg_wait"],
+		extensions: overrides.worker.extensions.map((path: string) => path === extensionPath ? waitProfilePath : path),
+	};
+	await writeFile(join(profileCwd, ".pi/settings.json"), JSON.stringify({ subagents: { defaultExtensions: [], agentOverrides: { worker: waitRole } } }));
+	const profileAgent = discoverAgents(profileCwd, "project").agents.find((agent: any) => agent.name === "worker");
+	assert.ok(profileAgent);
+	const rolePolicyPlans: any[] = [];
+	for (const host of ["parent", "runner"]) {
+		const launch = buildInProcessChildLaunch({ ...profileAgent, host, cwd: profileCwd, childAgentName: "worker", childIndex: 0, sessionEnabled: false });
+		assert.ok(launch.session.tools.includes("bg_wait"));
+		assert.ok(launch.session.extensionPaths.includes(waitProfilePath));
+		assert.ok(!launch.session.extensionPaths.includes(extensionPath));
+		assert.equal(launch.session.ambientExtensions, false);
+		rolePolicyPlans.push({ host, tools: launch.session.tools, extensionPaths: launch.session.extensionPaths });
+	}
 	const extensionPolicyPlans: any[] = [];
 	for (const [name, selection] of [["omitted", undefined], ["empty", []], ["explicit", [rtkPath]]] as const) {
 		for (const host of ["parent", "runner"] as const) {
@@ -267,15 +331,15 @@ async function inspectConfigurationPlans(): Promise<any> {
 		assert.equal(launch.session.ambientExtensions, false);
 		extensionPolicyPlans.push({ name: "default-empty", host, ambientExtensions: launch.session.ambientExtensions, extensionPaths: launch.session.extensionPaths });
 	}
-	console.log(JSON.stringify({ configurationPlans: plans.length, extensionPolicyPlans: extensionPolicyPlans.length }));
-	return { overrides, plans, extensionPolicyPlans, allDiscoveredAgents: discovered.agents.map((agent: any) => ({ name: agent.name, extensions: agent.extensions })) };
+	console.log(JSON.stringify({ configurationPlans: plans.length, extensionPolicyPlans: extensionPolicyPlans.length, rolePolicyPlans: rolePolicyPlans.length }));
+	return { overrides, plans, extensionPolicyPlans, rolePolicyPlans, allDiscoveredAgents: discovered.agents.map((agent: any) => ({ name: agent.name, extensions: agent.extensions })) };
 }
 
 function hash(value: unknown): string {
 	return createHash("sha256").update(typeof value === "string" ? value : JSON.stringify(value)).digest("hex").slice(0, 16);
 }
 function systemText(body: any): string {
-	return body.instructions ?? (body.input ?? []).filter((item: any) => item.role === "developer" || item.role === "system")
+	return body.instructions ?? (body.input ?? body.messages ?? []).filter((item: any) => item.role === "developer" || item.role === "system")
 		.filter((item: any) => item.type !== "additional_tools").map((item: any) => JSON.stringify(item.content)).join("\n");
 }
 function inlineDefinitions(body: any): any[] {
@@ -309,7 +373,7 @@ function documentFixture(): Buffer {
 function describe(captured: Captured): any {
 	return {
 		active: captured.active,
-		topLevelTools: (captured.body.tools ?? []).map((tool: any) => tool.name ?? tool.type),
+		topLevelTools: (captured.body.tools ?? []).map((tool: any) => tool.name ?? tool.function?.name ?? tool.type),
 		topLevelToolsHash: hash(captured.body.tools ?? []),
 		systemHash: hash(systemText(captured.body)),
 		inlineDefinitions: inlineDefinitions(captured.body),
@@ -327,6 +391,7 @@ async function runScenario(scenario: Scenario): Promise<void> {
 		version: 1,
 		tools: ["grep", "find", "ls"].map((name) => ({ name, source: name === "ls" || !scenario.fff ? "builtin" : "cli", policy: scenario.name === "fff-policy-migration" ? "excluded" : "always" })),
 	}));
+	if (scenario.eager) await writeFile(join(cwd, ".pi/pi-tool-search.json"), JSON.stringify({ version: 1, mode: "eager", tools: [] }));
 	new ProjectTrustStore(agentDir).set(cwd, true);
 	process.chdir(scenario.wrongCwd ? projectRoot : cwd);
 	const errors: string[] = [];
@@ -342,7 +407,8 @@ async function runScenario(scenario: Scenario): Promise<void> {
 	};
 	requests.set(scenario.name, []);
 	pendingSnapshots.set(scenario.name, []);
-	const eager = scenario.mode === "fallback" || scenario.replacePrompt;
+	const eager = scenario.eager || scenario.replacePrompt;
+	const portable = scenario.mode === "fallback" && !eager;
 	sequences.set(scenario.name, [...(scenario.actions ?? (eager ? standardActions.filter((action) => !("name" in action) || action.name !== "tool_search") : standardActions))]);
 	const observer = {
 		name: "probe-observer",
@@ -383,7 +449,7 @@ async function runScenario(scenario: Scenario): Promise<void> {
 		const launch = {
 			cwd, storage: { kind: "dir", sessionDir: join(cwd, "sessions") }, model: `compat-probe/${scenario.name}`,
 			...(scenario.inheritTools ? {} : { tools: selectedTools }),
-			extensionPaths: scenario.configRole ? roleOverrides[scenario.configRole].extensions.map(resolveRoleExtension) : [...(scenario.fff ? [join(fffRoot, "src/index.ts")] : []), extensionPath],
+			extensionPaths: scenario.configRole ? roleOverrides[scenario.configRole].extensions.map(resolveRoleExtension) : [...(scenario.fff ? [join(fffRoot, "src/index.ts")] : []), scenario.waitProfile ? waitProfilePath : extensionPath],
 			ambientExtensions: false, hooks: [observer, ...createChildHooks(runtime)], runtime,
 			noSkills: true, noContextFiles: true,
 			...(scenario.replacePrompt ? { systemPrompt: "Child probe role." } : { appendSystemPrompt: "Child probe role." }),
@@ -411,7 +477,7 @@ async function runScenario(scenario: Scenario): Promise<void> {
 			name: scenario.name, modelRequests: captured.length, firstRun,
 			catalogNames: initialCatalog.map((tool: any) => tool.name),
 			toolSources: initialCatalog.filter((tool: any) => ["grep", "find", "ls", "tool_search"].includes(tool.name)).map((tool: any) => ({ name: tool.name, source: tool.sourceInfo.source })),
-			api: scenario.codex ? "openai-codex-responses" : "openai-responses",
+			api: scenario.chatCompletions ? "openai-completions" : scenario.codex ? "openai-codex-responses" : "openai-responses",
 			requests: captured.map(describe),
 			toolResults: toolResults.map((message: any) => ({ name: message.toolName, isError: message.isError, addedToolNames: message.addedToolNames, details: message.details, content: message.content })),
 			assistantErrors: child.messages.filter((message: any) => message.role === "assistant" && message.errorMessage).map((message: any) => message.errorMessage),
@@ -419,6 +485,15 @@ async function runScenario(scenario: Scenario): Promise<void> {
 				betaRemainsHidden: captured.every((entry) => !entry.active.includes("probe_beta")),
 				loaderAdditionsExact: toolResults.filter((message: any) => message.toolName === "tool_search" && message.addedToolNames?.length).every((message: any) => JSON.stringify(message.addedToolNames) === JSON.stringify(message.details.added)),
 				topLevelToolsStable: new Set(captured.map((entry) => hash(entry.body.tools ?? []))).size === 1,
+				portableDefinitions: !portable || captured.every((entry) => {
+					const names = (entry.body.tools ?? []).map((tool: any) => tool.name ?? tool.function?.name);
+					return inlineDefinitions(entry.body).length === 0
+						&& names.length === entry.active.length && entry.active.every((name) => names.includes(name));
+				}),
+				portableChangesOnlyOnActivation: !portable || scenario.lateRegistration || captured.every((entry, index) => index === 0
+					|| (hash(entry.active) === hash(captured[index - 1].active)) === (hash(entry.body.tools) === hash(captured[index - 1].body.tools))),
+				additiveActiveSets: eager || scenario.lateRegistration || captured.every((entry, index) => index === 0
+					|| captured[index - 1].active.every((name) => entry.active.includes(name))),
 				systemStable: new Set(captured.map((entry) => hash(systemText(entry.body)))).size === 1,
 				inlineHistoryStable: captured.every((entry, index) => index === 0 || positionedInlineDefinitions(captured[index - 1].body).every((previous, position) => hash(previous) === hash(positionedInlineDefinitions(entry.body)[position]))),
 				fffGuidelinesPresent: !scenario.fff || captured.every((entry) => systemText(entry.body).includes("prefer bare identifiers")),
@@ -440,7 +515,13 @@ async function runScenario(scenario: Scenario): Promise<void> {
 				configuredWeb: !scenario.configRole || (eager
 					? captured.every((entry) => ["web_search", "fetch_content", "get_search_content"].every((name) => entry.active.includes(name)) && !entry.active.includes("tool_search"))
 					: !captured[0].active.includes("web_search") && captured.at(-1)!.active.includes("web_search")
-						&& !captured.at(-1)!.active.includes("fetch_content") && JSON.stringify(inlineDefinitions(captured.at(-1)!.body)).includes('"name":"web_search"')),
+						&& !captured.at(-1)!.active.includes("fetch_content") && !captured.at(-1)!.active.includes("get_search_content")
+						&& JSON.stringify(portable ? captured.at(-1)!.body.tools : inlineDefinitions(captured.at(-1)!.body)).includes('"name":"web_search"')),
+				waitPolicy: !selectedTools.includes("bg_wait")
+					? captured.every((entry) => !entry.active.includes("bg_wait"))
+					: scenario.waitProfile ? captured.every((entry) => entry.active.includes("bg_wait"))
+						: !captured[0].active.includes("bg_wait") && (scenario.name.startsWith("bg-wait-")
+							? captured.at(-1)!.active.includes("bg_wait") : captured.every((entry) => !entry.active.includes("bg_wait"))),
 				supervisorAlwaysActive: !scenario.supervisor || captured.every((entry) => entry.active.includes("contact_supervisor")),
 			},
 			errors, finalActive: extensionApi.getActiveTools(), sessionFile: child.sessionFile,
@@ -463,16 +544,21 @@ function assertResults(): number {
 		const result = results.find((value) => value.name === scenario.name);
 		verify(result && !result.fatal, `${scenario.name}: completed`);
 		verify(result.errors.length === 0 && result.assistantErrors.length === 0, `${scenario.name}: runtime errors`);
-		const eager = scenario.mode === "fallback" || scenario.replacePrompt;
+		const eager = scenario.eager || scenario.replacePrompt;
+		const portable = scenario.mode === "fallback" && !eager;
 		verify(eager && !scenario.configRole ? !result.checks.betaRemainsHidden : result.checks.betaRemainsHidden, `${scenario.name}: beta visibility does not match mode`);
 		verify(result.checks.loaderAdditionsExact, `${scenario.name}: incidental activation polluted loader result`);
 		verify(result.checks.deferredGuidelinesInitial, `${scenario.name}: missing initial conditional guidelines`);
 		verify(result.checks.noToolExecutionErrors, `${scenario.name}: tool execution errors`);
 		verify(result.checks.documentScope, `${scenario.name}: document provider scope mismatch`);
 		verify(result.checks.documentManifest, `${scenario.name}: document manifest contains unavailable tools or omits available ones`);
+		verify(result.checks.portableDefinitions, `${scenario.name}: portable wire tool list differs from active tools`);
+		verify(result.checks.portableChangesOnlyOnActivation, `${scenario.name}: portable definitions changed without activation`);
+		verify(result.checks.additiveActiveSets, `${scenario.name}: loaded tools were removed`);
+		verify(result.checks.waitPolicy, `${scenario.name}: bg_wait policy mismatch`);
 		if (scenario.mode !== "fallback") verify(result.checks.inlineHistoryStable, `${scenario.name}: historical inline definitions moved or changed`);
 		if (!scenario.lateRegistration) {
-			verify(result.checks.topLevelToolsStable, `${scenario.name}: prefix tools changed`);
+			if (!portable) verify(result.checks.topLevelToolsStable, `${scenario.name}: prefix tools changed`);
 			verify(result.checks.systemStable, `${scenario.name}: tool-metadata prefix changed`);
 		}
 		if (scenario.sevenPolicy) {
@@ -498,8 +584,10 @@ function assertResults(): number {
 	verify(!noLoader.catalogNames.includes("tool_search"), "loader bypassed allowlist");
 	const noDocuments = results.find((value) => value.name === "docparser-unloaded");
 	verify(noDocuments.toolResults.some((value: any) => value.name === "tool_search" && value.details.added.length === 0 && documentTools.every((name) => value.details.unknown.includes(name))), "missing document provider was not rejected by loader");
-	const cold = results.find((value) => value.name === "concurrent-idle");
-	verify(cold.requests.every((value: any) => !value.active.includes("probe_alpha")), "loaded state leaked across concurrent children");
+	for (const name of ["concurrent-idle", "concurrent-portable-idle", "concurrent-wait-idle"]) {
+		const cold = results.find((value) => value.name === name);
+		verify(cold.requests.every((value: any) => !value.active.includes("probe_alpha")), `${name}: loaded state leaked across concurrent children`);
+	}
 	return assertions;
 }
 
@@ -515,7 +603,7 @@ try {
 	for (const [name, root] of [["pi", piRoot], ["subagents", subagentsRoot], ["fff", fffRoot], ["web", webRoot], ["docparser", docparserRoot]]) {
 		versions[name] = JSON.parse(await readFile(join(root, "package.json"), "utf8")).version;
 	}
-	const sourceFiles = await Promise.all((await readdir(dirname(extensionPath))).filter((name) => name.endsWith(".ts")).sort()
+	const sourceFiles = await Promise.all((await readdir(dirname(extensionPath), { recursive: true })).filter((name) => name.endsWith(".ts")).sort()
 		.map(async (name) => [name, createHash("sha256").update(await readFile(join(dirname(extensionPath), name))).digest("hex")]));
 	const sourceSha256 = hash(sourceFiles);
 	await writeFile(join(probeRoot, "report.json"), JSON.stringify({ versions, extensionPath, sourceSha256, sourceFiles, results, configuration, verifiedAssertions, transportErrors, assertionError: String(assertionError ?? "") }, null, 2));

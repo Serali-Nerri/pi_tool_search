@@ -94,7 +94,13 @@ export async function saveToolSearchConfiguration(
 	return { path, records, changedNames: catalog.applyPolicies(selected) };
 }
 
-export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath: string): void {
+export interface ToolSearchOptions {
+	/** Role-specific pins, applied only to tools already registered and allowed by Pi. */
+	alwaysTools?: readonly string[];
+}
+
+export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath: string, options: ToolSearchOptions = {}): void {
+	const alwaysTools = new Set(options.alwaysTools ?? []);
 	let catalog = new ToolCatalog();
 	let savedPolicies = new Map<string, ToolPolicy>();
 	let projectPolicies = new Map<string, ToolPolicy>();
@@ -110,7 +116,9 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 	let auditEnabled = false;
 	const history = new ActivationHistory();
 	const audit = new RequestAudit();
-	const useDeferred = () => enabled && mode === "auto" && native && standardPrompt;
+	// Pi chooses native inline definitions or its normal active-list fallback.
+	// Both transports support additive activation; only their cache behavior differs.
+	const useDeferred = () => enabled && mode === "auto" && standardPrompt;
 
 	const ownsLoader = (): boolean => {
 		const tool = pi.getAllTools().find(({ name }) => name === TOOL_SEARCH_NAME);
@@ -189,7 +197,7 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 	};
 
 	const refreshCatalog = (): boolean =>
-		catalog.refresh(pi.getAllTools(), new Set(pi.getActiveTools()), savedPolicies, projectPolicies);
+		catalog.refresh(pi.getAllTools(), new Set(pi.getActiveTools()), savedPolicies, projectPolicies, alwaysTools);
 
 	const restoreForContext = (context: ExtensionContext): void => {
 		const sessionManager = context.sessionManager as typeof context.sessionManager & {
@@ -220,8 +228,8 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 		return collision
 			? "collision: another extension owns tool_search; no tools were deferred"
 			: useDeferred()
-				? `on · ${deferred.length - loadedCount} deferred · ${loadedCount} loaded · ${catalog.withPolicy("always").length} always · ${catalog.withPolicy("excluded").length} excluded`
-				: `${enabled ? "eager" : "off"} · ${deferred.length} deferred tools restored · ${catalog.withPolicy("excluded").length} excluded · ${!enabled || mode === "eager" ? "explicit setting" : !native ? "model has no declared incremental-tool support" : "custom/unrecognized prompt template"}`;
+				? `on · ${native ? "native" : "portable"} · ${deferred.length - loadedCount} deferred · ${loadedCount} loaded · ${catalog.withPolicy("always").length} always · ${catalog.withPolicy("excluded").length} excluded${native ? "" : " · loading changes the ordinary tools list; cache reuse may be affected"}`
+				: `${enabled ? "eager" : "off"} · ${deferred.length} deferred tools restored · ${catalog.withPolicy("excluded").length} excluded · ${!enabled || mode === "eager" ? "explicit setting" : "custom/unrecognized prompt template"}`;
 	};
 
 	registerLoader(true);
@@ -266,7 +274,7 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 		applyMode();
 		if (collision) return;
 		if (!standardPrompt) {
-			if (enabled && native && !warnedTemplate) {
+			if (enabled && mode === "auto" && !warnedTemplate) {
 				warnedTemplate = true;
 				const message = "pi-tool-search: custom/unrecognized system prompt; using fixed allowed tools. Use Pi's default prompt with append for deferred metadata.";
 				if (context.hasUI) context.ui.notify(message, "warning");

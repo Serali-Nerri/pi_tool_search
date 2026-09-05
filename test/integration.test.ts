@@ -450,13 +450,72 @@ test("turn_end reasserts the deferred subset after another extension registers a
 	assert.equal(harness.getActiveTools().includes("late_tool"), false);
 });
 
-test("model capability changes select a fixed allowed surface and can return to deferred mode", async () => {
+test("model capability changes preserve loaded tools and leave other tools deferred", async () => {
 	const harness = await startHarness({ externalTools });
+	await harness.tool("tool_search").execute!("load", { tool_names: ["web_search"] });
+	const active = harness.getActiveTools();
+	const notifications: string[] = [];
 	await harness.emitAsync("model_select", { model: { api: "openai-responses" } }, extensionContext());
-	assert.equal(harness.getActiveTools().includes("web_search"), true);
-	assert.equal(harness.getActiveTools().includes("tool_search"), false);
+	assert.deepEqual(harness.getActiveTools(), active);
+	await harness.command("tool-search").handler("status", extensionContext([], notifications));
+	assert.match(notifications.at(-1)!, /on · portable/);
 	await harness.emitAsync("model_select", { model: nativeModel }, extensionContext());
+	assert.deepEqual(harness.getActiveTools(), active);
+	await harness.command("tool-search").handler("status", extensionContext([], notifications));
+	assert.match(notifications.at(-1)!, /on · native/);
+});
+
+for (const api of ["openai-responses", "openai-completions", "anthropic-messages", "google-generative-ai"]) {
+	test(`${api} without native flags uses additive portable loading and survives registry refresh`, async () => {
+		const context = { ...extensionContext(), model: { api } };
+		const harness = createHarness({ externalTools, refreshActivatesAllowlist: true });
+		await harness.emitAsync("session_start", {}, context);
+		assert.equal(harness.getActiveTools().includes("web_search"), false);
+		assert.equal(harness.getActiveTools().includes("tool_search"), true);
+		const loader = harness.tool("tool_search");
+		const metadata = await harness.emitAsync("before_agent_start", {}, context);
+		await loader.execute!("load", { tool_names: ["web_search"] });
+		harness.addExternalTool({ name: "late_tool", description: "Late", source: "npm:late" });
+		await harness.emitAsync("turn_end", { toolResults: [] }, context);
+		assert.equal(harness.getActiveTools().includes("web_search"), true);
+		assert.equal(harness.getActiveTools().includes("document_parse"), false);
+		assert.equal(harness.getActiveTools().includes("late_tool"), false);
+		const repeated = await harness.tool("tool_search").execute!("again", { tool_names: ["web_search"] });
+		assert.deepEqual(repeated.details.added, []);
+		assert.deepEqual(await harness.emitAsync("before_agent_start", {}, context), metadata);
+	});
+}
+
+test("explicit eager restores allowed tools, respects exclusions and stays eager after on", async () => {
+	const cwd = mkdtempSync(join(testRoot, "eager-"));
+	mkdirSync(join(cwd, ".pi"));
+	writeFileSync(join(cwd, ".pi/pi-tool-search.json"), JSON.stringify({ version: 1, mode: "eager", tools: [
+		{ name: "document_parse", source: "npm:pi-docparser", policy: "excluded" },
+	] }));
+	for (const model of [nativeModel, { api: "openai-completions" }]) {
+		const notifications: string[] = [];
+		const context = { ...extensionContext([], notifications), cwd, model };
+		const harness = createHarness({ externalTools });
+		await harness.emitAsync("session_start", {}, context);
+		await harness.command("tool-search").handler("on", context);
+		assert.equal(harness.getActiveTools().includes("web_search"), true);
+		assert.equal(harness.getActiveTools().includes("document_parse"), false);
+		assert.equal(harness.getActiveTools().includes("tool_search"), false);
+		assert.match(notifications.at(-1)!, /eager.*explicit setting/);
+	}
+});
+
+test("portable mode off and on restore allowed tools and reset loaded state", async () => {
+	const context = { ...extensionContext(), model: { api: "openai-completions" } };
+	const harness = createHarness({ externalTools });
+	await harness.emitAsync("session_start", {}, context);
+	await harness.tool("tool_search").execute!("load", { tool_names: ["web_search"] });
+	await harness.command("tool-search").handler("off", context);
+	assert.equal(harness.getActiveTools().includes("document_parse"), true);
+	assert.equal(harness.getActiveTools().includes("tool_search"), false);
+	await harness.command("tool-search").handler("on", context);
 	assert.equal(harness.getActiveTools().includes("web_search"), false);
+	assert.equal(harness.getActiveTools().includes("document_parse"), false);
 	assert.equal(harness.getActiveTools().includes("tool_search"), true);
 });
 
