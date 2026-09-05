@@ -1,0 +1,8 @@
+node_modules/
+dist/
+coverage/
+tmp/
+.pi/pi-tool-search.json
+.pi/claude-style-tools.json
+*.log
+.DS_Store
