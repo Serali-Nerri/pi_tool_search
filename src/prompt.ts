@@ -32,6 +32,7 @@ export function stabilizeToolMetadata(
 	entries: readonly ToolCatalogEntry[],
 	deferred: boolean,
 	previousOptions: BuildSystemPromptOptions = options,
+	activeToolNames: ReadonlySet<string> = new Set(options.selectedTools ?? []),
 ): string | undefined {
 	if (options.customPrompt) return undefined;
 	const bounds = metadataBounds(prompt);
@@ -66,14 +67,17 @@ export function stabilizeToolMetadata(
 	for (const entry of visible) {
 		for (const guide of entry.tool.promptGuidelines ?? []) if (guide.trim()) guides.add(guide.trim());
 	}
+	// Deferred tools contribute their own guidance only after activation. Before
+	// that point their capability summary remains in the loader manifest, while
+	// their full schema and prompt metadata stay out of the system prompt.
 	let budget = DEFERRED_GUIDELINES_MAX_BYTES;
-	if (deferred) for (const entry of entries.filter((entry) => entry.policy === "deferred")) {
+	if (deferred) for (const entry of entries.filter((entry) =>
+		entry.policy === "deferred" && activeToolNames.has(entry.tool.name))) {
 		for (const guide of entry.tool.promptGuidelines ?? []) {
 			if (!guide.trim()) continue;
-			const conditional = `After loading ${entry.tool.name} with tool_search: ${guide.trim()}`;
-			const size = Buffer.byteLength(`- ${conditional}\n`, "utf8");
+			const size = Buffer.byteLength(`- ${guide.trim()}\n`, "utf8");
 			if (size > budget) continue;
-			guides.add(conditional);
+			guides.add(guide.trim());
 			budget -= size;
 		}
 	}

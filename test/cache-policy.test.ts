@@ -125,14 +125,17 @@ test("global defaults and trusted project overrides retain precedence across leg
 	} finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("stable metadata retains conditional deferred guidelines and excludes unavailable tools", () => {
+test("stable metadata omits deferred guidelines until the tool is active", () => {
 	const entries = [entry("read", "always"), entry("alpha", "deferred"), entry("hidden", "excluded")];
 	const options = { cwd: "/tmp", toolSnippets: { read: "read snippet", alpha: "alpha snippet", hidden: "hidden snippet" } };
 	const initial = prompt(["read"], ["read guideline", "Be concise in your responses"]);
 	const after = prompt(["read", "alpha"], ["read guideline", "alpha guideline", "Be concise in your responses"]);
-	const stable = stabilizeToolMetadata(initial, options, entries, true)!;
-	assert.equal(stable, stabilizeToolMetadata(after, options, entries, true));
-	assert.match(stable, /After loading alpha with tool_search: alpha guideline/);
+	const stable = stabilizeToolMetadata(initial, options, entries, true, options, new Set(["read"]))!;
+	assert.equal(stable, stabilizeToolMetadata(after, options, entries, true, options, new Set(["read"])));
+	assert.doesNotMatch(stable, /alpha guideline/);
+	assert.doesNotMatch(stable, /After loading/);
+	const activated = stabilizeToolMetadata(after, options, entries, true, options, new Set(["read", "alpha"]))!;
+	assert.match(activated, /- alpha guideline/);
 	assert.doesNotMatch(stable, /- alpha:|hidden/);
 	assert.match(stable, /Current project safety instructions/);
 });
@@ -161,7 +164,7 @@ test("deferred guideline metadata is bounded and multiline bullets do not accumu
 	multi.tool.promptGuidelines = ["Use carefully\n  with context"];
 	const entries = [multi, large];
 	const raw = prompt([], [...multi.tool.promptGuidelines, "Be concise in your responses"]);
-	const stable = stabilizeToolMetadata(raw, { cwd: "/tmp" }, entries, true)!;
+	const stable = stabilizeToolMetadata(raw, { cwd: "/tmp" }, entries, true, undefined, new Set(["multi", "large"]))!;
 	assert.ok(Buffer.byteLength(stable) < DEFERRED_GUIDELINES_MAX_BYTES + 400);
 	assert.equal((stable.match(/Use carefully/g) ?? []).length, 1);
 });

@@ -8,7 +8,7 @@
 
 ## 验证依据
 
-`npm run verify` 通过严格 TypeScript 检查及 57 项单元/集成测试。包括：稳定 manifest、白名单刷新、七工具/控制工具策略、bg_wait 默认延迟与角色固定、通用加载和模型切换、显式 eager、源身份、元数据变更、受信任项目优先级、child cwd、恢复、提供者替换、缺少提供者时的目录过滤、碰撞、审计默认关闭、有界渲染，以及配置合并/备份和部署失败保护。
+`npm run verify` 通过严格 TypeScript 检查及 61 项单元/集成测试。包括：真实 Pi SDK 的启动注册顺序、reload 和延后注册工具的恢复，稳定 manifest、白名单刷新、七工具/控制工具策略、bg_wait 默认延迟与角色固定、通用加载和模型切换、显式 eager、源身份、元数据变更、受信任项目优先级、child cwd、恢复、提供者替换、缺少提供者时的目录过滤、碰撞、审计默认关闭、有界渲染，以及配置合并/备份和部署失败保护。
 
 `npm run test:subagents` 运行真实安装包的 `createDefaultChildSessionFactory()`、`createChildHooks()` 和 Pi agent loop。使用回环 HTTP 服务接收最终序列化请求，返回确定性的 Responses / Chat Completions SSE；支持 Codex zstd 请求体。mock 会检查被调用工具实际 active 且存在于请求定义中。源代码没有被测试内的替代实现或提示稳定化补丁替换。
 
@@ -19,7 +19,7 @@
 | 原生协议 | `additional_tools` 与 `tool_search_output` 两条路径，以及 `openai-codex-responses` |
 | 通用协议 | 无原生能力声明的 Responses 和 Chat Completions：仅首轮常驻工具；激活后普通 tools 与 active 集合一致；无原生内联定义；重复加载不改变工具列表 |
 | 加载和继续 | 仅请求 A 时 B 隐藏；重复请求 A 不改变 manifest；跨用户提示、关闭后重新打开会话的工具定义稳定 |
-| 提示元数据 | deferred 指南首次请求就带加载条件；FFF 指南保留；普通加载不改变系统提示 |
+| 提示元数据 | deferred 指南仅在对应工具激活后加入；FFF 指南保留；未激活工具不会注入指南 |
 | FFF | 仅全局 override 的 fresh child；执行真实 grep/find；旧 grep/find/ls excluded 策略迁移 |
 | 范围和隔离 | 缺 loader、缺目标、只读子集、supervisor 常驻、不同 cwd、六个并发 child 的 native/portable loaded 状态和角色 pin 相互独立 |
 | 动态目录 | 其他扩展运行期注册新工具后重申子集；历史内联定义不夹带未批准工具；目录改变允许顶层 manifest 改变 |
@@ -39,6 +39,8 @@ Pi 0.85 的 `_refreshToolRegistry()` 在显式 `allowedToolNames` 下会重新�
 原生和通用路径共用同一套激活、会话恢复和白名单逻辑，均在加载后的下一次模型请求中提供新定义。两者的区别由 Pi 的提供者适配器序列化请求时产生；状态中的 `native` / `portable` 是基于能力声明的说明，协议验证以回环服务收到的实际请求为准。
 
 因此本扩展采用：
+
+启动与 reload 时，在所有 `session_start` 回调结束后通过 `resources_discover` 再次同步目录、恢复加载状态并应用策略。这样可以处理依赖会话模式、在 `session_start` 中才注册的工具。后续仍保留模型请求前和工具回合结束时的检查：
 
 1. 完整、稳定的 loader manifest；普通激活只调用 `setActiveTools`，不重新注册 loader。
 2. `turn_end` 时重申 active 子集；该时间点早于 Pi 对下一轮工具列表的快照。

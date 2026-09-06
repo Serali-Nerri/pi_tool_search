@@ -6,11 +6,12 @@ Pi 的按需工具加载扩展，支持主会话和 `nicobailon/pi-subagents` �
 
 ## 工作方式
 
-- `tool_search` 按精确名称加载 1–5 个允许的 deferred 工具。
+- `tool_search` 按精确名称加载 1–5 个允许的 deferred 工具；目标已经在当前工具列表中时直接调用，无需再次搜索。
 - manifest 保留完整的允许延迟加载目录，已加载工具不从目录删除。普通加载不重新 `registerTool()`，不会因重新注册 loader 而触发 Pi 的白名单全量激活。
 - manifest 最多 8 KiB；单项短描述最多 160 UTF-8 bytes，不包含完整 JSON Schema。超过预算的条目会标明省略数量，知道精确名称时仍可加载。
-- FFF 等常驻工具的 `promptGuidelines` 保留。deferred 工具的指南预先以 `After loading <name> with tool_search: …` 注入，总预算 8 KiB；预算外的指南不额外注入。
+- FFF 等常驻工具的 `promptGuidelines` 保留。deferred 工具只有激活后才将其指南加入系统提示，总预算 8 KiB；未激活工具的指南不预先注入。
 - 只规范化可识别的 Pi 默认 `Available tools` 和 `Guidelines` 块；角色、项目、安全指令及其他上下文正常更新，不冻结整个系统提示。
+- 在全部 `session_start` 回调结束后的 `resources_discover` 阶段同步工具目录、恢复已加载状态并应用策略。像 `@mjakl/pi-processes` 这样在启动回调里注册的工具，首条消息前就按策略进入 manifest，未激活时隐藏完整定义；`/reload` 采用相同处理。
 - 在 `turn_end` 重申 active 子集，并校正附带激活的历史记录，避免其他扩展注册工具时把未请求工具泄漏到后续请求。
 - 每个会话独立维护 loaded 状态。恢复时优先使用成功加载结果中的提供者身份，兼容旧会话记录；策略读写使用 `ctx.cwd`，适配 child cwd 和 worktree。
 
@@ -232,7 +233,7 @@ npm run verify
 npm run test:subagents
 ```
 
-- `verify`：严格 TypeScript 检查及 57 项单元/集成测试。
+- `verify`：严格 TypeScript 检查及 61 项单元/集成测试，包含真实 Pi SDK 的启动顺序、reload 和启动后注册工具的状态恢复。
 - `test:subagents`：实际 Pi child factory + 实际 FFF/Web/RTK/Docparser 扩展 + 本机 Responses / Chat Completions SSE 服务。44 个场景、236 次 mock 请求、695 项结果断言，另检查六角色的 12 个前台/后台启动计划、8 个扩展加载策略计划、2 个角色常驻入口计划，以及发现的全部角色的扩展选择。覆盖通用加载、重复激活、恢复、显式 eager、bg_wait 按需/角色常驻及六个并发 child 的状态隔离；mock 还拒绝调用请求中没有定义或尚未激活的工具。RTK 验证调用实际 `rtk rewrite`，末端 bash 使用记录命令的测试桩。Docparser 使用本地生成的单页 PDF、关闭 OCR，不需要外网或真实模型请求。
 - 请求联测需本机已安装对应包和 RTK；其他机器可设置 `PROBE_PI_ROOT`、`PROBE_SUBAGENTS_ROOT`、`PROBE_FFF_ROOT`、`PROBE_WEB_ROOT`、`PROBE_RTK_ENTRY`、`PROBE_DOCPARSER_ROOT`，或用 `PROBE_TOOL_SEARCH_ENTRY` 指向待验证部署。脚本输出 `/tmp/pi-subagents-tool-search-*/report.json` 和逐场景请求记录。
 - 开发依赖包含 `@earendil-works/pi-server@0.85.0`，用于 Pi 0.85 顶层 SDK 导出的直接 Node 导入；不会部署它或修改全局 npm 包。

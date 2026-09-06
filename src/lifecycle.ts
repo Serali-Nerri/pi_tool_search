@@ -267,6 +267,15 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 		}
 	});
 
+	pi.on("resources_discover", (_event, context) => {
+		// Pi emits this after all session_start handlers, including providers
+		// that register mode-dependent tools during startup or reload.
+		refreshCatalog();
+		restoreForContext(context);
+		registerLoader();
+		applyMode();
+	});
+
 	pi.on("before_agent_start", (event, context) => {
 		native = supportsIncrementalTools(context.model);
 		standardPrompt = hasStandardToolMetadata(event.systemPrompt, event.systemPromptOptions);
@@ -283,7 +292,14 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 			return;
 		}
 		const options = event.systemPromptOptions;
-		const systemPrompt = stabilizeToolMetadata(event.systemPrompt, options, catalog.all(), useDeferred(), event.systemPromptOptions);
+		const systemPrompt = stabilizeToolMetadata(
+			event.systemPrompt,
+			options,
+			catalog.all(),
+			useDeferred(),
+			event.systemPromptOptions,
+			new Set(pi.getActiveTools()),
+		);
 		return systemPrompt === undefined ? undefined : { systemPrompt };
 	});
 

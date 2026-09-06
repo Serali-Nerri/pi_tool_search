@@ -230,6 +230,7 @@ const externalTools: ExternalTool[] = [
 async function startHarness(options: HarnessOptions = {}) {
 	const harness = createHarness(options);
 	await harness.emitAsync("session_start", { type: "session_start", reason: "startup" }, extensionContext());
+	await harness.emitAsync("resources_discover", { type: "resources_discover", cwd: testRoot, reason: "startup" }, extensionContext());
 	return harness;
 }
 
@@ -248,6 +249,8 @@ test("keeps base tools and the loader active while deferring other active tools"
 	const manifest = harness.tool("tool_search").description;
 	assert.match(manifest, /web_search — Search the web/);
 	assert.match(manifest, /document_parse — Parse documents/);
+	assert.match(manifest, /not already available/);
+	assert.match(manifest, /call loaded tools directly/);
 	assert.doesNotMatch(manifest, /JSON Schema|properties/i);
 });
 
@@ -261,6 +264,8 @@ test("tools that were already inactive remain excluded from search", async () =>
 test("activates exact deferred names additively without changing the manifest", async () => {
 	const harness = await startHarness({ externalTools });
 	const search = harness.tool("tool_search");
+	assert.match(search.promptGuidelines?.[0] ?? "", /not currently available/);
+	assert.match(search.promptSnippet ?? "", /active tools cannot perform/);
 	assert.ok(search.execute);
 	const result = await search.execute("search-1", { tool_names: ["web_search"] });
 	assert.deepEqual(result.details, {
