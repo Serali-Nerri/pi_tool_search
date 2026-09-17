@@ -9,7 +9,7 @@ import { RequestAudit } from "../src/audit.ts";
 import { supportsIncrementalTools } from "../src/capabilities.ts";
 import { loadEffectiveToolSearchPolicies, saveToolSearchPolicies } from "../src/config.ts";
 import { ActivationHistory } from "../src/history.ts";
-import { DEFERRED_GUIDELINES_MAX_BYTES, hasStandardToolMetadata, stabilizeToolMetadata } from "../src/prompt.ts";
+import { hasStandardToolMetadata, stabilizeToolMetadata } from "../src/prompt.ts";
 import { BASE_TOOL_NAMES, ToolCatalog, toolKey, type ToolCatalogEntry } from "../src/registry.ts";
 
 function tool(name: string, source = "npm:test", path = "/tmp/providers/test/index.ts"): ToolInfo {
@@ -37,7 +37,7 @@ test("capabilities use declared resolved-model protocol flags, never model-name 
 
 test("seven-tool and control defaults apply only to registered tools, including legacy exclusions", () => {
 	const catalog = new ToolCatalog();
-	const names = [...BASE_TOOL_NAMES, "tool_search", "contact_supervisor", "structured_output"];
+	const names = [...BASE_TOOL_NAMES, "tool_search", "contact_supervisor", "structured_output", "Agent", "StopAgent", "AgentStatus"];
 	const tools = names.map((name) => tool(name));
 	catalog.refresh(tools, new Set(), new Map(tools.map((value) => [toolKey(value), "excluded"])));
 	assert.ok(catalog.all().every((value) => value.policy === "always" && value.protected));
@@ -125,17 +125,16 @@ test("global defaults and trusted project overrides retain precedence across leg
 	} finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("stable metadata omits deferred guidelines until the tool is active", () => {
+test("stable metadata never injects deferred guidelines into the system prompt", () => {
 	const entries = [entry("read", "always"), entry("alpha", "deferred"), entry("hidden", "excluded")];
 	const options = { cwd: "/tmp", toolSnippets: { read: "read snippet", alpha: "alpha snippet", hidden: "hidden snippet" } };
 	const initial = prompt(["read"], ["read guideline", "Be concise in your responses"]);
 	const after = prompt(["read", "alpha"], ["read guideline", "alpha guideline", "Be concise in your responses"]);
-	const stable = stabilizeToolMetadata(initial, options, entries, true, options, new Set(["read"]))!;
-	assert.equal(stable, stabilizeToolMetadata(after, options, entries, true, options, new Set(["read"])));
+	const stable = stabilizeToolMetadata(initial, options, entries, true, options)!;
+	// Activation must not rewrite the system prompt: deferred guides travel with
+	// the tool_search result instead (see buildToolGuidance in tool.ts).
+	assert.equal(stable, stabilizeToolMetadata(after, options, entries, true, options));
 	assert.doesNotMatch(stable, /alpha guideline/);
-	assert.doesNotMatch(stable, /After loading/);
-	const activated = stabilizeToolMetadata(after, options, entries, true, options, new Set(["read", "alpha"]))!;
-	assert.match(activated, /- alpha guideline/);
 	assert.doesNotMatch(stable, /- alpha:|hidden/);
 	assert.match(stable, /Current project safety instructions/);
 });
@@ -152,21 +151,32 @@ test("changing role and safety text is preserved rather than freezing the system
 
 test("custom and ambiguous templates are left untouched", () => {
 	assert.equal(hasStandardToolMetadata("Custom role"), false);
+	assert.equal(hasStandardToolMetadata("Available tools:\nexample"), false);
 	const text = prompt(["read"], []);
-	assert.equal(stabilizeToolMetadata(text, { cwd: "/tmp", customPrompt: "Custom role" }, [], true), undefined);
+	assert.equal(stabilizeToolMetadata("Custom role", { cwd: "/tmp", customPrompt: "Custom role" }, [], true), undefined);
 	assert.equal(stabilizeToolMetadata(`${text}\n\nAvailable tools:\nexample`, { cwd: "/tmp" }, [], true), undefined);
 });
 
-test("deferred guideline metadata is bounded and multiline bullets do not accumulate", () => {
-	const large = entry("large", "deferred");
-	large.tool.promptGuidelines = Array.from({ length: 500 }, (_, i) => `${i}: ${"界".repeat(50)}`);
-	const multi = entry("multi", "deferred");
-	multi.tool.promptGuidelines = ["Use carefully\n  with context"];
-	const entries = [multi, large];
-	const raw = prompt([], [...multi.tool.promptGuidelines, "Be concise in your responses"]);
-	const stable = stabilizeToolMetadata(raw, { cwd: "/tmp" }, entries, true, undefined, new Set(["multi", "large"]))!;
-	assert.ok(Buffer.byteLength(stable) < DEFERRED_GUIDELINES_MAX_BYTES + 400);
-	assert.equal((stable.match(/Use carefully/g) ?? []).length, 1);
+test("an overridden prompt that carries Pi's blocks is rewritten for its own tool set", () => {
+	// Subagent sessions replace the system prompt but inherit a copy of Pi's
+	// prompt: the inherited tool list must describe the child's own tools.
+	const inherited = prompt(["read", "alpha", "ls", "tool_search"], ["alpha guideline", "Use ls for listings"]);
+	const entries = [entry("read", "always"), entry("alpha", "deferred")];
+	const options = {
+		cwd: "/tmp",
+		customPrompt: inherited,
+		toolSnippets: { read: "read snippet", alpha: "alpha snippet" },
+	};
+	assert.equal(hasStandardToolMetadata(inherited), true);
+	const output = stabilizeToolMetadata(inherited, options, entries, true, options)!;
+	assert.match(output, /- read: read snippet/);
+	assert.doesNotMatch(output, /- alpha:/);
+	assert.doesNotMatch(output, /- ls:/);
+	assert.doesNotMatch(output, /- tool_search:/);
+	assert.doesNotMatch(output, /alpha guideline/);
+	// Guidance that belongs to no known tool is preserved by design: the loader
+	// never guesses which extension owns an unrecognized line.
+	assert.match(output, /Use ls for listings/);
 });
 
 function result(name: string, addedToolNames: string[], details?: unknown): ContextEvent["messages"][number] {

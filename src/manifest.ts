@@ -11,8 +11,8 @@ function utf8Prefix(text: string, maxBytes: number): string {
 	return buffer.subarray(0, end).toString("utf8");
 }
 
-function cleanDescription(description: string): string {
-	return description
+function cleanDescription(description: string | null | undefined): string {
+	return (description ?? "")
 		.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
 		.replace(/\[([^\]]+)\]\([^\)]+\)/g, "$1")
 		.replace(/[`*#]+/g, "")
@@ -26,15 +26,29 @@ function firstSentence(text: string): string {
 	return match?.[0]?.trim() || text;
 }
 
-export function shortToolDescription(description: string, maxBytes = TOOL_DESCRIPTION_MAX_BYTES): string {
-	const cleaned = firstSentence(cleanDescription(description));
-	if (!cleaned) return "No description provided";
-	if (Buffer.byteLength(cleaned, "utf8") <= maxBytes) return cleaned;
+function clampToolText(text: string, maxBytes: number): string {
+	if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
 	const ellipsis = "…";
-	const prefix = utf8Prefix(cleaned, Math.max(0, maxBytes - Buffer.byteLength(ellipsis, "utf8")));
+	const prefix = utf8Prefix(text, Math.max(0, maxBytes - Buffer.byteLength(ellipsis, "utf8")));
 	const boundary = Math.max(prefix.lastIndexOf(" "), prefix.lastIndexOf(","), prefix.lastIndexOf(";"));
 	const clipped = boundary >= Math.floor(prefix.length * 0.6) ? prefix.slice(0, boundary) : prefix;
 	return `${clipped.trimEnd()}${ellipsis}`;
+}
+
+export function shortToolDescription(description: string | null | undefined, maxBytes = TOOL_DESCRIPTION_MAX_BYTES): string {
+	const cleaned = firstSentence(cleanDescription(description));
+	if (!cleaned) return "No description provided";
+	return clampToolText(cleaned, maxBytes);
+}
+
+/**
+ * Clean and bound a tool's promptSnippet for relocation into a tool result.
+ * Pi normalizes snippets before rendering them, but extensions never see that
+ * normalized value through getAllTools(), so repeat the cleaning here.
+ */
+export function boundedToolSnippet(snippet: string | null | undefined, maxBytes = TOOL_DESCRIPTION_MAX_BYTES): string | undefined {
+	const cleaned = cleanDescription(snippet);
+	return cleaned ? clampToolText(cleaned, maxBytes) : undefined;
 }
 
 export interface ToolManifest {

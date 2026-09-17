@@ -18,7 +18,7 @@ import { createToolSearchDefinition } from "./tool.ts";
 import { showToolSearchConfig } from "./ui.ts";
 import { supportsIncrementalTools } from "./capabilities.ts";
 import { activationDetails, ActivationHistory, stringArray } from "./history.ts";
-import { hasStandardToolMetadata, stabilizeToolMetadata } from "./prompt.ts";
+import { hasStandardToolMetadata, stabilizeToolMetadata, TOOLS_BLOCK_END, TOOLS_BLOCK_START } from "./prompt.ts";
 import { RequestAudit } from "./audit.ts";
 
 const TOOL_SEARCH_STATE_ENTRY = "pi-tool-search.state";
@@ -109,6 +109,28 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 	let lastDescription: string | undefined;
 	const loaded = new Map<string, string>();
 	const hiddenByThisExtension = new Set<string>();
+	// Pi only renders snippets for active tools and ToolInfo never exposes them,
+	// so remember every snippet seen while its tool was still active. Deferred
+	// tools keep their captured snippet until the session ends.
+	const snippets = new Map<string, string>();
+	const captureSnippets = (options?: { toolSnippets?: Record<string, string> }): void => {
+		for (const [name, snippet] of Object.entries(options?.toolSnippets ?? {})) {
+			const trimmed = snippet?.trim();
+			if (trimmed) snippets.set(name, trimmed);
+		}
+	};
+	// Pi hides deferred tools before before_agent_start ever sees them, so the
+	// startup prompt (and every reload) is the only place their snippets exist.
+	const captureSnippetsFromPrompt = (prompt: string | undefined): void => {
+		if (!prompt) return;
+		const start = prompt.indexOf(TOOLS_BLOCK_START);
+		const end = prompt.indexOf(TOOLS_BLOCK_END);
+		if (start < 0 || end < start) return;
+		for (const line of prompt.slice(start + TOOLS_BLOCK_START.length, end).split("\n")) {
+			const match = /^- ([A-Za-z0-9_.-]+): (.+)$/.exec(line.trim());
+			if (match?.[2]?.trim()) snippets.set(match[1], match[2].trim());
+		}
+	};
 	let mode: "auto" | "eager" = "auto";
 	let native = false;
 	let standardPrompt = true;
@@ -150,6 +172,7 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 			enabled: useDeferred,
 			owned: ownsLoader,
 			activate,
+			snippets: () => snippets,
 		});
 		if (!force && definition.description === lastDescription) return;
 		lastDescription = definition.description;
@@ -236,6 +259,7 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 
 	pi.on("session_start", async (_event, context) => {
 		cwd = context.cwd || cwd;
+		captureSnippetsFromPrompt(context.getSystemPrompt());
 		catalog = new ToolCatalog();
 		hiddenByThisExtension.clear();
 		lastDescription = undefined;
@@ -270,6 +294,7 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 	pi.on("resources_discover", (_event, context) => {
 		// Pi emits this after all session_start handlers, including providers
 		// that register mode-dependent tools during startup or reload.
+		captureSnippetsFromPrompt(context.getSystemPrompt());
 		refreshCatalog();
 		restoreForContext(context);
 		registerLoader();
@@ -277,8 +302,9 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 	});
 
 	pi.on("before_agent_start", (event, context) => {
+		captureSnippets(event.systemPromptOptions);
 		native = supportsIncrementalTools(context.model);
-		standardPrompt = hasStandardToolMetadata(event.systemPrompt, event.systemPromptOptions);
+		standardPrompt = hasStandardToolMetadata(event.systemPrompt);
 		if (refreshCatalog()) registerLoader();
 		applyMode();
 		if (collision) return;
@@ -298,7 +324,6 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 			catalog.all(),
 			useDeferred(),
 			event.systemPromptOptions,
-			new Set(pi.getActiveTools()),
 		);
 		return systemPrompt === undefined ? undefined : { systemPrompt };
 	});
@@ -330,6 +355,7 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 	});
 
 	pi.on("session_tree", (_event, context) => {
+		captureSnippetsFromPrompt(context.getSystemPrompt());
 		refreshCatalog();
 		restoreForContext(context);
 		registerLoader();
@@ -338,6 +364,7 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 
 	pi.on("session_shutdown", () => {
 		loaded.clear();
+		snippets.clear();
 		hiddenByThisExtension.clear();
 		history.reset();
 		audit.reset();

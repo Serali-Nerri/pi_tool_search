@@ -2,10 +2,11 @@ import type { AgentToolResult, ToolDefinition } from "@earendil-works/pi-coding-
 import type { Component } from "@earendil-works/pi-tui";
 import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
-import { buildToolSearchDescription } from "./manifest.ts";
+import { boundedToolSnippet, buildToolSearchDescription, shortToolDescription } from "./manifest.ts";
 import { TOOL_SEARCH_NAME, type ToolCatalogEntry } from "./registry.ts";
 
 export const TOOL_SEARCH_MAX_RESULTS = 5;
+export const TOOL_GUIDANCE_MAX_BYTES = 8 * 1024;
 
 export interface ToolSearchResultDetails {
 	matches: string[];
@@ -52,6 +53,57 @@ const EMPTY_COMPONENT: Component = {
 
 function joinedNames(names: readonly string[], fallback = "deferred tools"): string {
 	return names.length > 0 ? names.join(", ") : fallback;
+}
+
+/**
+ * Guidance for tools the model just activated.
+ *
+ * Pi's getAllTools() omits promptSnippet and hides deferred tools from
+ * before_agent_start options, so snippets are captured while the tools were
+ * still active (see captureSnippets in lifecycle.ts). When a snippet is known it
+ * labels the tool; otherwise the bounded rendered description stands in.
+ * Whitespace is collapsed so a multiline guideline cannot masquerade as extra
+ * bullets, and repeated guidance is emitted once per activation batch. The
+ * system prompt is never rewritten for deferred tools, which keeps its prefix
+ * byte-stable.
+ */
+export interface ToolGuidanceOptions {
+	/** Prompt snippets captured while the tools were still active, keyed by tool name. */
+	snippets?: ReadonlyMap<string, string>;
+	maxBytes?: number;
+}
+
+export function buildToolGuidance(
+	names: readonly string[],
+	byName: ReadonlyMap<string, ToolCatalogEntry>,
+	options: ToolGuidanceOptions = {},
+): string {
+	const maxBytes = options.maxBytes ?? TOOL_GUIDANCE_MAX_BYTES;
+	const lines = ["Tool guidance:"];
+	let usedBytes = Buffer.byteLength(`${lines[0]}\n`, "utf8");
+	const seen = new Set<string>();
+	for (const name of names) {
+		const entry = byName.get(name);
+		if (!entry) continue;
+		const label = options.snippets?.get(name);
+		const snippet = label ? boundedToolSnippet(label) : undefined;
+		const heading = `- ${name}: ${snippet ?? shortToolDescription(entry.tool.description)}`;
+		const headingBytes = Buffer.byteLength(`${heading}\n`, "utf8");
+		if (usedBytes + headingBytes > maxBytes) continue;
+		lines.push(heading);
+		usedBytes += headingBytes;
+		for (const raw of entry.tool.promptGuidelines ?? []) {
+			const guide = raw.replace(/\s+/g, " ").trim();
+			if (!guide || seen.has(guide)) continue;
+			const line = `  - ${guide}`;
+			const lineBytes = Buffer.byteLength(`${line}\n`, "utf8");
+			if (usedBytes + lineBytes > maxBytes) continue;
+			seen.add(guide);
+			lines.push(line);
+			usedBytes += lineBytes;
+		}
+	}
+	return lines.length > 1 ? lines.join("\n") : "";
 }
 
 function resultText(result: AgentToolResult<ToolSearchResultDetails> | undefined): string {
@@ -175,6 +227,7 @@ class ToolSearchResultComponent implements Component {
 		const lines: string[] = [];
 		let first = true;
 		for (const sourceLine of this.text.split("\n")) {
+			if (!sourceLine) continue;
 			const wrapped = wrapTextWithAnsi(this.style.muted(sourceLine), available);
 			for (const line of wrapped.length > 0 ? wrapped : [""]) {
 				lines.push(`${first ? `  ${this.style.muted("⎿ ")}` : "    "}${line}`);
@@ -193,6 +246,8 @@ interface ToolSearchDefinitionOptions {
 	enabled: () => boolean;
 	owned: () => boolean;
 	activate: (names: string[]) => { added: string[]; active: string[] };
+	/** Prompt snippets captured while the tools were still active. */
+	snippets?: () => ReadonlyMap<string, string>;
 }
 
 function editDistance(left: string, right: string): number {
@@ -301,6 +356,8 @@ export function createToolSearchDefinition(
 						: `Unknown deferred tool: ${name}.`,
 				);
 			}
+			const guidance = buildToolGuidance(added, byName, { snippets: options.snippets?.() });
+			if (guidance) lines.push("", guidance);
 			return {
 				content: [{ type: "text", text: lines.join("\n") || "No deferred tools were loaded." }],
 				details: { matches, added, active, unknown, loadedKeys: active.map((name) => byName.get(name)!.key) },

@@ -55,6 +55,8 @@ interface HarnessOptions {
 	externalTools?: ExternalTool[];
 	activeTools?: string[];
 	refreshActivatesAllowlist?: boolean;
+	/** Raw startup prompt used to capture prompt snippets before deferral. */
+	systemPrompt?: string;
 }
 
 function createHarness(options: HarnessOptions = {}) {
@@ -198,9 +200,10 @@ function rendered(component: Component, width = 120): string[] {
 	return component.render(width).map((line) => line.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, ""));
 }
 
-function extensionContext(entries: unknown[] = [], notifications: string[] = [], idle = true): any {
+function extensionContext(entries: unknown[] = [], notifications: string[] = [], idle = true, systemPrompt = ""): any {
 	return {
 		cwd: testRoot,
+		getSystemPrompt: () => systemPrompt,
 		model: nativeModel,
 		mode: "tui",
 		hasUI: true,
@@ -229,8 +232,9 @@ const externalTools: ExternalTool[] = [
 
 async function startHarness(options: HarnessOptions = {}) {
 	const harness = createHarness(options);
-	await harness.emitAsync("session_start", { type: "session_start", reason: "startup" }, extensionContext());
-	await harness.emitAsync("resources_discover", { type: "resources_discover", cwd: testRoot, reason: "startup" }, extensionContext());
+	const context = () => extensionContext([], [], true, options.systemPrompt);
+	await harness.emitAsync("session_start", { type: "session_start", reason: "startup" }, context());
+	await harness.emitAsync("resources_discover", { type: "resources_discover", cwd: testRoot, reason: "startup" }, context());
 	return harness;
 }
 
@@ -278,12 +282,40 @@ test("activates exact deferred names additively without changing the manifest", 
 	assert.equal(harness.getActiveTools().includes("web_search"), true);
 	assert.equal(harness.tool("tool_search"), search);
 	assert.match(harness.tool("tool_search").description, /web_search/);
+	assert.match(result.content[0].text, /Tool guidance:/);
+	assert.match(result.content[0].text, /- web_search: Search the web/);
 	const repeat = await search.execute("search-repeat", { tool_names: ["web_search"] });
 	assert.deepEqual(repeat.details.added, []);
 	assert.deepEqual(repeat.details.active, ["web_search"]);
+	assert.doesNotMatch(repeat.content[0].text, /Tool guidance:/);
 	const typo = await search.execute("search-typo", { tool_names: ["web_seach"] });
 	assert.deepEqual(typo.details.unknown, ["web_seach"]);
 	assert.match(typo.content[0].text, /Did you mean: web_search/);
+});
+
+test("tool_search relocates prompt snippets captured before deferral", async () => {
+	const harness = await startHarness({
+		externalTools,
+		systemPrompt: [
+			"Role",
+			"",
+			"Available tools:",
+			"- read: Read files",
+			"- web_search: Use for web research questions. Prefer queries with varied angles.",
+			"",
+			"In addition to the tools above, more tools.",
+			"",
+			"Guidelines:",
+			"- Be concise in your responses",
+			"",
+			"Pi documentation (help)",
+		].join("\n"),
+	});
+	const search = harness.tool("tool_search");
+	assert.ok(search.execute);
+	const result = await search.execute("search-snippet", { tool_names: ["web_search"] });
+	assert.match(result.content[0].text, /- web_search: Use for web research questions\. Prefer queries with varied angles\./);
+	assert.doesNotMatch(result.content[0].text, /- web_search: Search the web$/m);
 });
 
 test("uses a compact status row and keeps full diagnostics expanded", async () => {
@@ -322,7 +354,11 @@ test("uses a compact status row and keeps full diagnostics expanded", async () =
 		state,
 	});
 	assert.deepEqual(rendered(expandedCall), ["✓ tool_search(web_search)"]);
-	assert.deepEqual(rendered(expandedResult), ["  ⎿ Loaded tools: web_search"]);
+	assert.deepEqual(rendered(expandedResult), [
+		"  ⎿ Loaded tools: web_search",
+		"    Tool guidance:",
+		"    - web_search: Search the web",
+	]);
 	for (const width of [1, 2, 3, 4]) {
 		for (const line of rendered(expandedResult, width)) assert.ok(visibleWidth(line) <= width);
 	}

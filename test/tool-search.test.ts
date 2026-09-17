@@ -26,7 +26,7 @@ import {
 	loadTrustedToolSearchPolicies,
 	saveToolSearchConfiguration,
 } from "../src/index.ts";
-import { suggestToolNames } from "../src/tool.ts";
+import { buildToolGuidance, suggestToolNames, TOOL_GUIDANCE_MAX_BYTES } from "../src/tool.ts";
 import { toolSearchEntryLabel } from "../src/ui.ts";
 
 function tool(name: string, source: string, description = `${name} description`): ToolInfo {
@@ -52,6 +52,19 @@ test("short descriptions sanitize markdown and stay within the UTF-8 budget", ()
 	assert.match(short, /^解析_document。/);
 });
 
+test("missing or empty descriptions never break the manifest", () => {
+	assert.equal(shortToolDescription(undefined), "No description provided");
+	assert.equal(shortToolDescription(null), "No description provided");
+	assert.equal(shortToolDescription("   "), "No description provided");
+	const missing = tool("Agent", "src");
+	missing.description = undefined as unknown as string;
+	const entries: ToolCatalogEntry[] = [
+		{ key: "src\u0000Agent", tool: missing, policy: "deferred", protected: false },
+	];
+	const manifest = buildToolManifest(entries);
+	assert.match(manifest.text, /Agent — No description provided/);
+});
+
 test("the deferred manifest is bounded and contains only names plus short descriptions", () => {
 	const entries: ToolCatalogEntry[] = Array.from({ length: 20 }, (_, index) => ({
 		key: `source\u0000tool_${index}`,
@@ -64,6 +77,60 @@ test("the deferred manifest is bounded and contains only names plus short descri
 	assert.ok(manifest.omitted > 0);
 	assert.match(manifest.text, /tool_0 — Capability 0\./);
 	assert.doesNotMatch(manifest.text, /parameters|properties|JSON Schema/i);
+});
+
+test("activated tools receive bounded guidance in the tool_search result", () => {
+	const entries: ToolCatalogEntry[] = [
+		{
+			key: "src\u0000alpha",
+			tool: { ...tool("alpha", "src"), promptGuidelines: ["Use alpha carefully", "Shared guidance", "   "] },
+			policy: "deferred",
+			protected: false,
+		},
+		{
+			key: "src\u0000beta",
+			tool: { ...tool("beta", "src", "Beta\n  description"), promptGuidelines: ["Use carefully\n  with context", "Shared guidance"] },
+			policy: "deferred",
+			protected: false,
+		},
+	];
+	const byName = new Map(entries.map((entry) => [entry.tool.name, entry]));
+	const guidance = buildToolGuidance(["alpha", "beta"], byName);
+	assert.match(guidance, /^Tool guidance:\n- alpha: alpha description\n  - Use alpha carefully\n  - Shared guidance\n- beta: Beta description\n  - Use carefully with context/);
+	assert.equal((guidance.match(/Shared guidance/g) ?? []).length, 1);
+	assert.equal((guidance.match(/Use carefully/g) ?? []).length, 1);
+	assert.equal(buildToolGuidance(["missing"], byName), "");
+	assert.equal(buildToolGuidance([], byName), "");
+});
+
+test("tool guidance prefers a captured prompt snippet over the description", () => {
+	const entries: ToolCatalogEntry[] = [
+		{ key: "src\u0000alpha", tool: { ...tool("alpha", "src"), promptGuidelines: undefined }, policy: "deferred", protected: false },
+	];
+	const byName = new Map(entries.map((entry) => [entry.tool.name, entry]));
+	const captured = new Map([["alpha", "  Use alpha for **varied** angles.  "]]);
+	assert.equal(
+		buildToolGuidance(["alpha"], byName, { snippets: captured }),
+		"Tool guidance:\n- alpha: Use alpha for varied angles.",
+	);
+	assert.match(buildToolGuidance(["alpha"], byName), /- alpha: alpha description/);
+	assert.match(buildToolGuidance(["alpha"], byName, { snippets: new Map([["alpha", "   "]]) }), /- alpha: alpha description/);
+});
+
+test("tool guidance stays within the UTF-8 budget", () => {
+	const entries: ToolCatalogEntry[] = Array.from({ length: 6 }, (_, index) => ({
+		key: `src\u0000tool_${index}`,
+		tool: {
+			...tool(`tool_${index}`, "src", `Capability ${index}`),
+			promptGuidelines: Array.from({ length: 60 }, (_, line) => `${line}: ${"\u754c".repeat(60)}`),
+		},
+		policy: "deferred",
+		protected: false,
+	}));
+	const byName = new Map(entries.map((entry) => [entry.tool.name, entry]));
+	const guidance = buildToolGuidance(entries.map((entry) => entry.tool.name), byName);
+	assert.ok(Buffer.byteLength(guidance, "utf8") <= TOOL_GUIDANCE_MAX_BYTES);
+	assert.match(guidance, /- tool_0: Capability 0/);
 });
 
 test("catalog defaults every active non-base tool to deferred and inactive tools to excluded", () => {

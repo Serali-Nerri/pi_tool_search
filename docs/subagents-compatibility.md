@@ -6,9 +6,19 @@
 
 本项目可用于 nicobailon 的主/子代理工作流，不需要修改已安装的 pi-subagents、FFF 或 Pi 核心源码。使用 [README 中的配置](../README.md#nicobailonpi-subagents-配置) 和 [完整六角色示例](subagents-settings.example.json)。`auto` 使用原生或通用路径按需加载；显式 `eager` 固定展示允许工具。
 
+## 后续变更（2026-09-17）
+
+上述验证之后，本扩展把 deferred 工具的提示元数据从系统提示词迁移到了 `tool_search` 的结果文本：
+
+- deferred 工具的 `promptGuidelines` 不再在激活后写回 `Guidelines:` 块，而是随 `tool_search` 的返回文本交付（预算 8 KiB，去重、空白折叠）；
+- 结果文本的标题行优先使用延迟前捕获的 `promptSnippet`（`session_start` / `resources_discover` / `session_tree` 解析启动提示词，`before_agent_start` 再刷新），缺失时回退到受限 short description；
+- 因此激活不再改写系统提示词，前缀在激活前后字节不变。
+
+权威描述见 [README《工具元数据的归属与迁移》](../README.md#工具元数据的归属与迁移)。
+
 ## 验证依据
 
-`npm run verify` 通过严格 TypeScript 检查及 61 项单元/集成测试。包括：真实 Pi SDK 的启动注册顺序、reload 和延后注册工具的恢复，稳定 manifest、白名单刷新、七工具/控制工具策略、bg_wait 默认延迟与角色固定、通用加载和模型切换、显式 eager、源身份、元数据变更、受信任项目优先级、child cwd、恢复、提供者替换、缺少提供者时的目录过滤、碰撞、审计默认关闭、有界渲染，以及配置合并/备份和部署失败保护。
+`npm run verify` 通过严格 TypeScript 检查及 61 项单元/集成测试（当次验证时的数量；2026-09-17 已增至 65 项）。包括：真实 Pi SDK 的启动注册顺序、reload 和延后注册工具的恢复，稳定 manifest、白名单刷新、七工具/控制工具策略、bg_wait 默认延迟与角色固定、通用加载和模型切换、显式 eager、源身份、元数据变更、受信任项目优先级、child cwd、恢复、提供者替换、缺少提供者时的目录过滤、碰撞、审计默认关闭、有界渲染，以及配置合并/备份和部署失败保护。
 
 `npm run test:subagents` 运行真实安装包的 `createDefaultChildSessionFactory()`、`createChildHooks()` 和 Pi agent loop。使用回环 HTTP 服务接收最终序列化请求，返回确定性的 Responses / Chat Completions SSE；支持 Codex zstd 请求体。mock 会检查被调用工具实际 active 且存在于请求定义中。源代码没有被测试内的替代实现或提示稳定化补丁替换。
 
@@ -19,7 +29,7 @@
 | 原生协议 | `additional_tools` 与 `tool_search_output` 两条路径，以及 `openai-codex-responses` |
 | 通用协议 | 无原生能力声明的 Responses 和 Chat Completions：仅首轮常驻工具；激活后普通 tools 与 active 集合一致；无原生内联定义；重复加载不改变工具列表 |
 | 加载和继续 | 仅请求 A 时 B 隐藏；重复请求 A 不改变 manifest；跨用户提示、关闭后重新打开会话的工具定义稳定 |
-| 提示元数据 | deferred 指南仅在对应工具激活后加入；FFF 指南保留；未激活工具不会注入指南 |
+| 提示元数据 | deferred 指南随 `tool_search` 结果返回（2026-09-17 起不再写入系统提示，激活前后系统提示字节不变）；FFF 指南保留；未激活工具不会注入指南 |
 | FFF | 仅全局 override 的 fresh child；执行真实 grep/find；旧 grep/find/ls excluded 策略迁移 |
 | 范围和隔离 | 缺 loader、缺目标、只读子集、supervisor 常驻、不同 cwd、六个并发 child 的 native/portable loaded 状态和角色 pin 相互独立 |
 | 动态目录 | 其他扩展运行期注册新工具后重申子集；历史内联定义不夹带未批准工具；目录改变允许顶层 manifest 改变 |

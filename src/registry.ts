@@ -21,6 +21,9 @@ export const TOOL_SEARCH_NAME = "tool_search";
 export const BASE_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
 export const PROTECTED_TOOL_NAMES = new Set<string>([
 	...BASE_TOOL_NAMES, TOOL_SEARCH_NAME, "contact_supervisor", "structured_output",
+	// Subagent control plane: lite-fork tools ship without descriptions and must
+	// stay visible so the model can spawn/stop/inspect agents without tool_search.
+	"Agent", "StopAgent", "AgentStatus",
 ]);
 export const DEFAULT_EXCLUDED_TOOL_NAMES = new Set(["powershell"]);
 

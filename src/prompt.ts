@@ -1,9 +1,14 @@
 import type { BuildSystemPromptOptions } from "@earendil-works/pi-coding-agent";
 import { TOOL_SEARCH_NAME, type ToolCatalogEntry } from "./registry.ts";
 
-export const DEFERRED_GUIDELINES_MAX_BYTES = 8 * 1024;
-const TOOLS_START = "\n\nAvailable tools:\n";
-const TOOLS_END = "\n\nIn addition to the tools above,";
+/**
+ * Pi's tool metadata markers. Deferred tools never contribute prompt metadata:
+ * their capability summary lives in the loader manifest and their guidance
+ * travels with the tool_search result (see buildToolGuidance in tool.ts), so the
+ * system prompt stays byte-stable across activations.
+ */
+export const TOOLS_BLOCK_START = "\n\nAvailable tools:\n";
+export const TOOLS_BLOCK_END = "\n\nIn addition to the tools above,";
 const GUIDES_START = "\n\nGuidelines:\n";
 const GUIDES_END = "\n\nPi documentation (";
 const EXPLORATION_GUIDES = [
@@ -13,7 +18,7 @@ const EXPLORATION_GUIDES = [
 ];
 
 function metadataBounds(prompt: string): number[] | undefined {
-	const markers = [TOOLS_START, TOOLS_END, GUIDES_START, GUIDES_END];
+	const markers = [TOOLS_BLOCK_START, TOOLS_BLOCK_END, GUIDES_START, GUIDES_END];
 	const positions = markers.map((marker) => prompt.indexOf(marker));
 	if (positions.some((position, index) => position < 0
 		|| prompt.indexOf(markers[index], position + 1) !== -1
@@ -21,8 +26,14 @@ function metadataBounds(prompt: string): number[] | undefined {
 	return positions;
 }
 
-export function hasStandardToolMetadata(prompt: string, options?: BuildSystemPromptOptions): boolean {
-	return !options?.customPrompt && metadataBounds(prompt) !== undefined;
+/**
+ * Pi's tool metadata markers are the only signal we trust: subagent sessions
+ * override the system prompt (customPrompt) but inherit a full copy of Pi's
+ * prompt, tool list and guidelines included, so that copy must be rewritten
+ * for the child's own tool set just like a top-level prompt.
+ */
+export function hasStandardToolMetadata(prompt: string): boolean {
+	return metadataBounds(prompt) !== undefined;
 }
 
 /** Rewrite only known Pi metadata blocks. Role, safety, skills and project text stay current. */
@@ -32,9 +43,7 @@ export function stabilizeToolMetadata(
 	entries: readonly ToolCatalogEntry[],
 	deferred: boolean,
 	previousOptions: BuildSystemPromptOptions = options,
-	activeToolNames: ReadonlySet<string> = new Set(options.selectedTools ?? []),
 ): string | undefined {
-	if (options.customPrompt) return undefined;
 	const bounds = metadataBounds(prompt);
 	if (!bounds) return undefined;
 	const [toolStart, toolEnd, guideStart, guideEnd] = bounds;
@@ -67,22 +76,8 @@ export function stabilizeToolMetadata(
 	for (const entry of visible) {
 		for (const guide of entry.tool.promptGuidelines ?? []) if (guide.trim()) guides.add(guide.trim());
 	}
-	// Deferred tools contribute their own guidance only after activation. Before
-	// that point their capability summary remains in the loader manifest, while
-	// their full schema and prompt metadata stay out of the system prompt.
-	let budget = DEFERRED_GUIDELINES_MAX_BYTES;
-	if (deferred) for (const entry of entries.filter((entry) =>
-		entry.policy === "deferred" && activeToolNames.has(entry.tool.name))) {
-		for (const guide of entry.tool.promptGuidelines ?? []) {
-			if (!guide.trim()) continue;
-			const size = Buffer.byteLength(`- ${guide.trim()}\n`, "utf8");
-			if (size > budget) continue;
-			guides.add(guide.trim());
-			budget -= size;
-		}
-	}
 	const guidelineText = [...[...guides].map((guide) => `- ${guide}`), remainder.trimEnd()]
 		.filter(Boolean).join("\n");
-	return prompt.slice(0, toolStart) + TOOLS_START + (tools.join("\n") || "(none)")
+	return prompt.slice(0, toolStart) + TOOLS_BLOCK_START + (tools.join("\n") || "(none)")
 		+ prompt.slice(toolEnd, guideStart) + GUIDES_START + guidelineText + prompt.slice(guideEnd);
 }
