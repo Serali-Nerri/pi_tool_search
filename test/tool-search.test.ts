@@ -267,7 +267,7 @@ test("configuration labels lock the seven base tools only", () => {
 		policy: "always" as const,
 		protected: true,
 	};
-	assert.equal(toolSearchEntryLabel(search, search.tool.sourceInfo.path), "pi-tool-search · tool_search");
+	assert.equal(toolSearchEntryLabel(search, search.tool.sourceInfo.path), "pi-tool-search · tool_search 🔒");
 	// User-configured tools never get the lock either.
 	const mcp: ToolCatalogEntry = {
 		key: "npm:pi-mcp-adapter\u0000mcp",

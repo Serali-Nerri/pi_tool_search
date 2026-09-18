@@ -3,7 +3,7 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
 import { shortToolDescription } from "./manifest.ts";
-import { BASE_TOOL_NAMES, type ToolCatalogEntry, type ToolPolicy } from "./registry.ts";
+import { BASE_TOOL_NAMES, TOOL_SEARCH_NAME, type ToolCatalogEntry, type ToolPolicy } from "./registry.ts";
 
 const POLICY_VALUES: ToolPolicy[] = ["always", "deferred", "excluded"];
 const BASE_TOOL_NAME_SET = new Set<string>(BASE_TOOL_NAMES);
@@ -12,9 +12,11 @@ export function toolSearchEntryLabel(entry: ToolCatalogEntry, extensionPath: str
 	const owner = resolve(entry.tool.sourceInfo.path) === resolve(extensionPath)
 		? "pi-tool-search"
 		: entry.tool.sourceInfo.source;
-	// The lock is a static badge for the seven builtin base tools only.
-	// Configuration never confers it; it only governs each tool's policy.
-	return `${owner} · ${entry.tool.name}${BASE_TOOL_NAME_SET.has(entry.tool.name) ? " 🔒" : ""}`;
+	// The lock is a static badge for the seven builtin base tools plus the
+	// tool_search loader itself. Configuration never confers it; it only
+	// governs each tool's policy.
+	const locked = BASE_TOOL_NAME_SET.has(entry.tool.name) || entry.tool.name === TOOL_SEARCH_NAME;
+	return `${owner} · ${entry.tool.name}${locked ? " 🔒" : ""}`;
 }
 
 export async function showToolSearchConfig(
