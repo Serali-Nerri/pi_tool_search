@@ -252,6 +252,35 @@ test("tool configuration labels use the actual winning source", () => {
 	assert.equal(toolSearchEntryLabel(external, "/extension/pi-tool-search/index.ts"), "npm:override · read 🔒");
 });
 
+test("configuration labels lock the seven base tools only", () => {
+	const agent: ToolCatalogEntry = {
+		key: "auto\u0000Agent",
+		tool: tool("Agent", "auto"),
+		policy: "always" as const,
+		protected: true,
+	};
+	// Protected by code but not a base tool: no lock.
+	assert.equal(toolSearchEntryLabel(agent, "/extension/pi-tool-search/index.ts"), "auto · Agent");
+	const search: ToolCatalogEntry = {
+		key: "pi-tool-search\u0000tool_search",
+		tool: tool("tool_search", "pi-tool-search"),
+		policy: "always" as const,
+		protected: true,
+	};
+	assert.equal(toolSearchEntryLabel(search, search.tool.sourceInfo.path), "pi-tool-search · tool_search");
+	// User-configured tools never get the lock either.
+	const mcp: ToolCatalogEntry = {
+		key: "npm:pi-mcp-adapter\u0000mcp",
+		tool: tool("mcp", "npm:pi-mcp-adapter"),
+		policy: "always" as const,
+		protected: false,
+	};
+	assert.equal(
+		toolSearchEntryLabel(mcp, "/extension/pi-tool-search/index.ts"),
+		"npm:pi-mcp-adapter · mcp",
+	);
+});
+
 test("a failed policy save leaves the in-memory catalog unchanged", async () => {
 	const cwd = await mkdtemp(join(tmpdir(), "pi-tool-search-save-failure-"));
 	try {
