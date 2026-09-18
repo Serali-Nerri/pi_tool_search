@@ -1,16 +1,17 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 import type { ContextEvent, ToolInfo } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { RequestAudit } from "../src/audit.ts";
 import { supportsIncrementalTools } from "../src/capabilities.ts";
-import { loadEffectiveToolSearchPolicies, saveToolSearchPolicies } from "../src/config.ts";
+import { loadEffectiveToolSearchPolicies, loadToolSearchPolicies, saveToolSearchPolicies } from "../src/config.ts";
 import { ActivationHistory } from "../src/history.ts";
 import { hasStandardToolMetadata, stabilizeToolMetadata } from "../src/prompt.ts";
-import { PROTECTED_TOOL_NAMES, ToolCatalog, toolKey, type ToolCatalogEntry } from "../src/registry.ts";
+import { PROTECTED_TOOL_NAMES, ToolCatalog, isOwnedBy, normalizeExtensionPath, toolKey, type ToolCatalogEntry } from "../src/registry.ts";
 
 function tool(name: string, source = "npm:test", path = "/tmp/providers/test/index.ts"): ToolInfo {
 	return { name, description: `${name} description`, parameters: Type.Object({}), promptGuidelines: [`${name} guideline`], sourceInfo: { source, path, scope: "user", origin: "package" } };
@@ -236,3 +237,72 @@ test("request audit fingerprints stable prefix sections and historical inline po
 	assert.doesNotMatch(audit.status(), /"Role"|"task"/);
 });
 
+test("catalog tolerates unserializable tool schemas without breaking refresh", () => {
+	const catalog = new ToolCatalog();
+	const value = tool("odd");
+	(value.parameters as Record<string, unknown>).self = value.parameters;
+	assert.equal(catalog.refresh([value], new Set(["odd"]), new Map()), true);
+	assert.equal(catalog.refresh([value], new Set(["odd"]), new Map()), false);
+});
+
+test("catalog ordering is code-point deterministic, never locale-dependent", () => {
+	const catalog = new ToolCatalog();
+	const names = ["toolsearch", "tool_searchx", "Tool_Searchx"];
+	catalog.refresh(names.map((name) => tool(name)), new Set(names), new Map());
+	assert.deepEqual(
+		catalog.all().map((entry) => entry.tool.name),
+		["Tool_Searchx", "tool_searchx", "toolsearch"],
+	);
+});
+
+test("duplicate tool names resolve to a single last-in-order winner", () => {
+	const catalog = new ToolCatalog();
+	const first = tool("dup", "cli", "/tmp/dup-a.ts");
+	const second = tool("dup", "cli", "/tmp/dup-b.ts");
+	catalog.refresh([first, second], new Set(["dup"]), new Map());
+	assert.equal(catalog.byName("dup")?.key, toolKey(second));
+});
+
+test("ownership comparison normalizes file URLs, home paths and relatives", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-tool-search-owned-"));
+	try {
+		const entry = join(cwd, "src", "index.ts");
+		const owned = tool("tool_search", "cli", "./src/index.ts");
+		assert.equal(isOwnedBy(owned, entry, cwd), true);
+		const fileUrl = tool("tool_search", "cli", pathToFileURL(entry).href);
+		assert.equal(isOwnedBy(fileUrl, entry, cwd), true);
+		const home = tool("tool_search", "cli", join(homedir(), "ext", "index.ts"));
+		assert.equal(isOwnedBy(home, join(homedir(), "ext", "index.ts"), cwd), true);
+		assert.equal(normalizeExtensionPath("~/ext/index.ts", cwd), join(homedir(), "ext", "index.ts"));
+		const builtin = tool("read", "builtin", "<builtin:read>");
+		assert.equal(isOwnedBy(builtin, entry, cwd), false);
+		assert.equal(isOwnedBy(builtin, "<builtin:read>", cwd), true);
+		assert.equal(isOwnedBy(owned, join(cwd, "other", "index.ts"), cwd), false);
+	} finally {
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("policy records carrying NUL bytes are ignored on load", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-tool-search-nul-"));
+	try {
+		await mkdir(join(cwd, ".pi"), { recursive: true });
+		await writeFile(
+			join(cwd, ".pi", "pi-tool-search.json"),
+			JSON.stringify({ version: 1, tools: [{ name: "a\u0000b", source: "x", policy: "always" }] }),
+		);
+		const loaded = await loadToolSearchPolicies(cwd);
+		assert.equal(loaded.policies.size, 0);
+	} finally {
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("tool snippets ignore inherited object properties", () => {
+	const catalog = new ToolCatalog();
+	const ctor = tool("constructor");
+	catalog.refresh([ctor], new Set(["constructor"]), new Map());
+	const text = prompt(["constructor"], []);
+	const rewritten = stabilizeToolMetadata(text, { cwd: "/tmp", toolSnippets: {} }, catalog.all(), false);
+	assert.ok(rewritten && !rewritten.includes("- constructor:"));
+});

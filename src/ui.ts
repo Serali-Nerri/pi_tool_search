@@ -1,14 +1,17 @@
-import { resolve } from "node:path";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
 import { shortToolDescription } from "./manifest.ts";
-import type { ToolCatalogEntry, ToolPolicy } from "./registry.ts";
+import { isOwnedBy, normalizeExtensionPath, type ToolCatalogEntry, type ToolPolicy } from "./registry.ts";
 
 const POLICY_VALUES: ToolPolicy[] = ["always", "deferred", "excluded"];
 
-export function toolSearchEntryLabel(entry: ToolCatalogEntry, extensionPath: string): string {
-	const owner = resolve(entry.tool.sourceInfo.path) === resolve(extensionPath)
+export function toolSearchEntryLabel(
+	entry: ToolCatalogEntry,
+	extensionPath: string,
+	cwd = process.cwd(),
+): string {
+	const owner = isOwnedBy(entry.tool, extensionPath, cwd)
 		? "pi-tool-search"
 		: entry.tool.sourceInfo.source;
 	// The lock means exactly one thing: this row cannot be changed (forced
@@ -28,17 +31,20 @@ export async function showToolSearchConfig(
 	context: ExtensionCommandContext,
 	entries: readonly ToolCatalogEntry[],
 	extensionPath: string,
+	cwd = process.cwd(),
 ): Promise<Map<string, ToolPolicy> | undefined> {
 	if (context.mode !== "tui") {
 		context.ui.notify("/tool-search config requires TUI mode", "error");
 		return undefined;
 	}
 	const ordered = sortConfigEntries(entries);
+	// Normalize once: the per-row label check must not re-resolve the same path.
+	const normalizedExtension = normalizeExtensionPath(extensionPath, cwd);
 	const working = new Map(ordered.map((entry) => [entry.key, entry.policy]));
 	return context.ui.custom<Map<string, ToolPolicy> | undefined>((tui, theme, _keybindings, done) => {
 		const items: SettingItem[] = ordered.map((entry) => ({
 			id: entry.key,
-			label: toolSearchEntryLabel(entry, extensionPath),
+			label: toolSearchEntryLabel(entry, normalizedExtension, cwd),
 			description: shortToolDescription(entry.tool.description),
 			currentValue: entry.policy,
 			values: entry.protected ? ["always"] : POLICY_VALUES,

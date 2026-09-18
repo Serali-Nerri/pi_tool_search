@@ -51,20 +51,34 @@ export function stabilizeToolMetadata(
 		? deferred || entry.tool.name !== TOOL_SEARCH_NAME
 		: entry.policy === "deferred" && !deferred);
 	const snippets = options.toolSnippets ?? {};
-	const tools = visible.filter((entry) => snippets[entry.tool.name])
-		.map((entry) => `- ${entry.tool.name}: ${snippets[entry.tool.name]}`);
+	const snippetFor = (name: string): string | undefined => {
+		// Plain-object lookup must not match Object.prototype members: a tool
+		// literally named "constructor" would otherwise inject native code.
+		if (!Object.hasOwn(snippets, name)) return undefined;
+		const value: unknown = snippets[name];
+		return typeof value === "string" ? value : undefined;
+	};
+	const tools: string[] = [];
+	for (const entry of visible) {
+		const snippet = snippetFor(entry.tool.name);
+		if (snippet !== undefined) tools.push(`- ${entry.tool.name}: ${snippet}`);
+	}
 
-	// Remove only exact, known tool metadata. Unrecognized guideline text from
-	// another extension is preserved, including changes between user prompts.
+	// Remove only exact, known tool metadata lines in a single pass. Unrecognized
+	// guideline text from another extension is preserved, including changes
+	// between user prompts.
 	let remainder = `${prompt.slice(guideStart + GUIDES_START.length, guideEnd)}\n`;
-	const known = new Set([
+	const removable = new Set<string>();
+	for (const guide of [
 		...EXPLORATION_GUIDES,
 		...(previousOptions.promptGuidelines ?? []),
 		...entries.flatMap((entry) => entry.tool.promptGuidelines ?? []),
-	]);
-	for (const guide of known) {
-		if (!guide.trim()) continue;
-		remainder = `\n${remainder}`.replaceAll(`\n- ${guide.trim()}\n`, "\n").slice(1);
+	]) {
+		const trimmed = guide.trim();
+		if (trimmed) removable.add(`- ${trimmed}`);
+	}
+	if (removable.size > 0) {
+		remainder = remainder.split("\n").filter((line) => !removable.has(line)).join("\n");
 	}
 	const guides = new Set<string>();
 	const names = new Set(visible.map((entry) => entry.tool.name));

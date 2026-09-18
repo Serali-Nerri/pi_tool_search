@@ -1,4 +1,3 @@
-import { resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
 import {
@@ -8,6 +7,7 @@ import {
 	type LoadedToolSearchPolicies,
 } from "./config.ts";
 import {
+	isOwnedBy,
 	policyRecordKey,
 	ToolCatalog,
 	TOOL_SEARCH_NAME,
@@ -131,11 +131,12 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 	const ownsLoader = (): boolean => {
 		const tool = pi.getAllTools().find(({ name }) => name === TOOL_SEARCH_NAME);
 		if (!tool) return false;
-		return resolve(tool.sourceInfo.path) === resolve(extensionPath);
+		// Session cwd, not process.cwd(): Pi resolves relative -e paths against
+		// the session cwd, so `pi -e ./src/index.ts` still matches.
+		return isOwnedBy(tool, extensionPath, cwd);
 	};
 
 	const deferredEntries = () => catalog.withPolicy("deferred");
-	const lookupEntries = () => catalog.withPolicy("deferred");
 
 	const activate = (names: string[]): { added: string[]; active: string[] } => {
 		const activeBefore = pi.getActiveTools();
@@ -154,7 +155,6 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 		if (!force && !ownsLoader()) return;
 		const definition = createToolSearchDefinition({
 			deferredEntries,
-			lookupEntries,
 			enabled: useDeferred,
 			owned: ownsLoader,
 			activate,
@@ -190,8 +190,9 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 				.map((entry) => entry.tool.name),
 			...active.filter((name) => !byName.has(name)),
 		])];
+		const finalSet = new Set(finalNames);
 		const hiddenThisPass = active.filter(
-			(name) => byName.get(name)?.policy === "deferred" && !finalNames.includes(name),
+			(name) => byName.get(name)?.policy === "deferred" && !finalSet.has(name),
 		);
 		if (!sameNames(active, finalNames)) pi.setActiveTools(finalNames);
 		const activeAfter = new Set(pi.getActiveTools());
@@ -199,7 +200,7 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 			if (!activeAfter.has(name)) hiddenByThisExtension.add(name);
 		}
 		for (const name of [...hiddenByThisExtension]) {
-			if (activeAfter.has(name) || catalog.byName(name)?.policy !== "deferred") {
+			if (activeAfter.has(name) || byName.get(name)?.policy !== "deferred") {
 				hiddenByThisExtension.delete(name);
 			}
 		}
@@ -391,7 +392,7 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 				}
 				refreshCatalog();
 				const before = new Map(catalog.all().map((entry) => [entry.key, entry.policy]));
-				const selected = await showToolSearchConfig(context, catalog.all(), extensionPath);
+				const selected = await showToolSearchConfig(context, catalog.all(), extensionPath, cwd);
 				if (!selected) return;
 				let saved: Awaited<ReturnType<typeof saveToolSearchConfiguration>>;
 				try {

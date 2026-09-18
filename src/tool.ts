@@ -242,7 +242,6 @@ class ToolSearchResultComponent implements Component {
 
 interface ToolSearchDefinitionOptions {
 	deferredEntries: () => ToolCatalogEntry[];
-	lookupEntries?: () => ToolCatalogEntry[];
 	enabled: () => boolean;
 	owned: () => boolean;
 	activate: (names: string[]) => { added: string[]; active: string[] };
@@ -337,7 +336,7 @@ export function createToolSearchDefinition(
 				};
 			}
 
-			const entries = options.lookupEntries?.() ?? options.deferredEntries();
+			const entries = options.deferredEntries();
 			const byName = new Map(entries.map((entry) => [entry.tool.name, entry]));
 			const requested = [...new Set(params.tool_names)].slice(0, TOOL_SEARCH_MAX_RESULTS);
 			const matches = requested.filter((name) => byName.has(name));

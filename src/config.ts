@@ -81,6 +81,9 @@ async function loadToolSearchPoliciesAt(path: string): Promise<LoadedToolSearchP
 					typeof record.source !== "string" ||
 					!VALID_POLICIES.has(record.policy)
 				) continue;
+				// The NUL byte is our composite-key separator: a record carrying
+				// it could alias another tool's policy, so skip the record.
+				if (record.name.includes("\u0000") || record.source.includes("\u0000")) continue;
 				policies.set(policyRecordKey(record), record.policy);
 			}
 			return { policies, mode: parsed.mode, audit: parsed.audit };
@@ -132,7 +135,7 @@ export async function saveToolSearchPolicies(cwd: string, tools: ToolPolicyRecor
 		await rename(tempPath, path);
 		return path;
 	} catch (error) {
-		await rm(tempPath, { force: true });
+		await rm(tempPath, { force: true }).catch(() => undefined);
 		throw error;
 	}
 }
