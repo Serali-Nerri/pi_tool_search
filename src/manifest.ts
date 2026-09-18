@@ -85,8 +85,8 @@ export function buildToolManifest(
 export function buildToolSearchDescription(deferredEntries: readonly ToolCatalogEntry[]): string {
 	const manifest = buildToolManifest(deferredEntries);
 	return [
-		"Activate deferred tools by exact name when a needed tool is not already available. This searches tool capabilities, not project files or text.",
-		"Pass one to five exact tool_names from the manifest below. Pi provides full schemas after activation; call loaded tools directly.",
+		"Some tools are not provided upfront. Use this tool to load them by exact name, then call the loaded tools directly.",
+		"This searches tool capabilities, not project files or text. Pass one to five exact tool_names from the manifest below. Pi provides full schemas after activation.",
 		"",
 		"Available deferred tools:",
 		manifest.text || "- (none)",
