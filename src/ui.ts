@@ -19,6 +19,12 @@ export function toolSearchEntryLabel(entry: ToolCatalogEntry, extensionPath: str
 	return `${owner} · ${entry.tool.name}${locked ? " 🔒" : ""}`;
 }
 
+export function sortConfigEntries(entries: readonly ToolCatalogEntry[]): ToolCatalogEntry[] {
+	return [...entries].sort(
+		(left, right) => Number(right.tool.sourceInfo.source === "builtin") - Number(left.tool.sourceInfo.source === "builtin"),
+	);
+}
+
 export async function showToolSearchConfig(
 	context: ExtensionCommandContext,
 	entries: readonly ToolCatalogEntry[],
@@ -28,9 +34,10 @@ export async function showToolSearchConfig(
 		context.ui.notify("/tool-search config requires TUI mode", "error");
 		return undefined;
 	}
-	const working = new Map(entries.map((entry) => [entry.key, entry.policy]));
+	const ordered = sortConfigEntries(entries);
+	const working = new Map(ordered.map((entry) => [entry.key, entry.policy]));
 	return context.ui.custom<Map<string, ToolPolicy> | undefined>((tui, theme, _keybindings, done) => {
-		const items: SettingItem[] = entries.map((entry) => ({
+		const items: SettingItem[] = ordered.map((entry) => ({
 			id: entry.key,
 			label: toolSearchEntryLabel(entry, extensionPath),
 			description: shortToolDescription(entry.tool.description),

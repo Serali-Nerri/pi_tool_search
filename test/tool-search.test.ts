@@ -27,7 +27,7 @@ import {
 	saveToolSearchConfiguration,
 } from "../src/index.ts";
 import { buildToolGuidance, suggestToolNames, TOOL_GUIDANCE_MAX_BYTES } from "../src/tool.ts";
-import { toolSearchEntryLabel } from "../src/ui.ts";
+import { sortConfigEntries, toolSearchEntryLabel } from "../src/ui.ts";
 
 function tool(name: string, source: string, description = `${name} description`): ToolInfo {
 	return {
@@ -279,6 +279,17 @@ test("configuration labels lock the seven base tools only", () => {
 		toolSearchEntryLabel(mcp, "/extension/pi-tool-search/index.ts"),
 		"npm:pi-mcp-adapter · mcp",
 	);
+});
+
+test("configuration list sorts builtin tools first, preserving relative order", () => {
+	const mixed: ToolCatalogEntry[] = [
+		{ key: "npm:x\u0000zeta", tool: tool("zeta", "npm:x"), policy: "deferred" as const, protected: false },
+		{ key: "builtin\u0000write", tool: tool("write", "builtin"), policy: "always" as const, protected: true },
+		{ key: "auto\u0000Agent", tool: tool("Agent", "auto"), policy: "always" as const, protected: false },
+		{ key: "builtin\u0000bash", tool: tool("bash", "builtin"), policy: "always" as const, protected: true },
+	];
+	const sorted = sortConfigEntries(mixed).map((entry) => entry.tool.name);
+	assert.deepEqual(sorted, ["write", "bash", "zeta", "Agent"]);
 });
 
 test("a failed policy save leaves the in-memory catalog unchanged", async () => {

@@ -37,7 +37,7 @@ test("capabilities use declared resolved-model protocol flags, never model-name 
 
 test("seven-tool and control defaults apply only to registered tools, including legacy exclusions", () => {
 	const catalog = new ToolCatalog();
-	const names = [...BASE_TOOL_NAMES, "tool_search", "contact_supervisor", "structured_output", "Agent", "StopAgent", "AgentStatus"];
+	const names = [...BASE_TOOL_NAMES, "tool_search", "contact_supervisor", "structured_output"];
 	const tools = names.map((name) => tool(name));
 	catalog.refresh(tools, new Set(), new Map(tools.map((value) => [toolKey(value), "excluded"])));
 	assert.ok(catalog.all().every((value) => value.policy === "always" && value.protected));
@@ -55,6 +55,13 @@ test("bg_wait defaults to deferred and accepts saved policies or an isolated rol
 		catalog.refresh([wait], new Set(), new Map([[toolKey(wait), policy]]));
 		assert.equal(catalog.byName("bg_wait")?.policy, policy);
 	}
+	const agentCatalog = new ToolCatalog();
+	const agent = tool("Agent", "auto");
+	agentCatalog.refresh([agent], new Set([agent.name]), new Map());
+	assert.equal(agentCatalog.byName("Agent")?.policy, "deferred");
+	assert.equal(agentCatalog.byName("Agent")?.protected, false);
+	agentCatalog.refresh([agent], new Set(), new Map([[toolKey(agent), "always"]]));
+	assert.equal(agentCatalog.byName("Agent")?.policy, "always");
 	const pinned = new ToolCatalog();
 	pinned.refresh([wait], new Set(), new Map(), new Map(), new Set(["bg_wait"]));
 	assert.equal(pinned.byName("bg_wait")?.policy, "always");
