@@ -18,7 +18,9 @@ export function toolSearchEntryLabel(entry: ToolCatalogEntry, extensionPath: str
 
 export function sortConfigEntries(entries: readonly ToolCatalogEntry[]): ToolCatalogEntry[] {
 	return [...entries].sort(
-		(left, right) => Number(right.tool.sourceInfo.source === "builtin") - Number(left.tool.sourceInfo.source === "builtin"),
+		(left, right) =>
+			Number(right.protected) - Number(left.protected) ||
+			Number(right.tool.sourceInfo.source === "builtin") - Number(left.tool.sourceInfo.source === "builtin"),
 	);
 }
 

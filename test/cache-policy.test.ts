@@ -10,7 +10,7 @@ import { supportsIncrementalTools } from "../src/capabilities.ts";
 import { loadEffectiveToolSearchPolicies, saveToolSearchPolicies } from "../src/config.ts";
 import { ActivationHistory } from "../src/history.ts";
 import { hasStandardToolMetadata, stabilizeToolMetadata } from "../src/prompt.ts";
-import { BASE_TOOL_NAMES, ToolCatalog, toolKey, type ToolCatalogEntry } from "../src/registry.ts";
+import { PROTECTED_TOOL_NAMES, ToolCatalog, toolKey, type ToolCatalogEntry } from "../src/registry.ts";
 
 function tool(name: string, source = "npm:test", path = "/tmp/providers/test/index.ts"): ToolInfo {
 	return { name, description: `${name} description`, parameters: Type.Object({}), promptGuidelines: [`${name} guideline`], sourceInfo: { source, path, scope: "user", origin: "package" } };
@@ -35,25 +35,40 @@ test("capabilities use declared resolved-model protocol flags, never model-name 
 	assert.equal(supportsIncrementalTools({ api: "openai-responses", compat: { supportsToolReferences: true } }), false);
 });
 
-test("seven-tool and control defaults apply only to registered tools, including legacy exclusions", () => {
+test("locked defaults apply only to registered tools and ignore legacy exclusions", () => {
 	const catalog = new ToolCatalog();
-	const names = [...BASE_TOOL_NAMES, "tool_search"];
-	const tools = names.map((name) => tool(name));
+	const tools = [...PROTECTED_TOOL_NAMES].map((name) => tool(name));
 	catalog.refresh(tools, new Set(), new Map(tools.map((value) => [toolKey(value), "excluded"])));
 	assert.ok(catalog.all().every((value) => value.policy === "always" && value.protected));
-	catalog.refresh(tools.filter((value) => ["read", "grep", "tool_search"].includes(value.name)), new Set(), new Map());
+	catalog.refresh(tools.filter((value) => ["read", "tool_search"].includes(value.name)), new Set(), new Map());
 	assert.equal(catalog.byName("write"), undefined);
 });
 
-test("bg_wait defaults to deferred and accepts saved policies or an isolated role pin", () => {
-	const wait = tool("bg_wait", "npm:pi-subagents");
+test("named defaults stay user-configurable: grep/find/ls always, powershell excluded, nothing locked", () => {
 	const catalog = new ToolCatalog();
-	catalog.refresh([wait], new Set(), new Map());
-	assert.equal(catalog.byName("bg_wait")?.policy, "deferred");
-	assert.equal(catalog.byName("bg_wait")?.protected, false);
+	const tools = ["grep", "find", "ls", "powershell"].map((name) => tool(name));
+	catalog.refresh(tools, new Set(), new Map());
+	assert.ok(["grep", "find", "ls"].every((name) => catalog.byName(name)?.policy === "always"));
+	assert.equal(catalog.byName("powershell")?.policy, "excluded");
+	assert.ok(catalog.all().every((value) => !value.protected));
+	const overrides = new Map(tools.map((value) => [toolKey(value), "deferred" as const]));
+	catalog.refresh(tools, new Set(), overrides);
+	assert.ok(catalog.all().every((value) => value.policy === "deferred"));
+});
+
+test("ordinary tools follow the generic defaults and never lock", () => {
+	const wait = tool("helper", "npm:example");
+	const catalog = new ToolCatalog();
+	catalog.refresh([wait], new Set(["helper"]), new Map());
+	assert.equal(catalog.byName("helper")?.policy, "deferred");
+	assert.equal(catalog.byName("helper")?.protected, false);
+	// Registered but not initially active: the generic subagent rule applies.
+	const inactive = new ToolCatalog();
+	inactive.refresh([wait], new Set(), new Map());
+	assert.equal(inactive.byName("helper")?.policy, "excluded");
 	for (const policy of ["always", "excluded", "deferred"] as const) {
-		catalog.refresh([wait], new Set(), new Map([[toolKey(wait), policy]]));
-		assert.equal(catalog.byName("bg_wait")?.policy, policy);
+		catalog.refresh([wait], new Set(["helper"]), new Map([[toolKey(wait), policy]]));
+		assert.equal(catalog.byName("helper")?.policy, policy);
 	}
 	const agentCatalog = new ToolCatalog();
 	const agent = tool("Agent", "auto");
@@ -62,13 +77,11 @@ test("bg_wait defaults to deferred and accepts saved policies or an isolated rol
 	assert.equal(agentCatalog.byName("Agent")?.protected, false);
 	agentCatalog.refresh([agent], new Set(), new Map([[toolKey(agent), "always"]]));
 	assert.equal(agentCatalog.byName("Agent")?.policy, "always");
-	const pinned = new ToolCatalog();
-	pinned.refresh([wait], new Set(), new Map(), new Map(), new Set(["bg_wait"]));
-	assert.equal(pinned.byName("bg_wait")?.policy, "always");
-	assert.equal(pinned.byName("bg_wait")?.protected, true);
-	assert.equal(catalog.byName("bg_wait")?.policy, "deferred");
-	pinned.refresh([], new Set(), new Map(), new Map(), new Set(["bg_wait"]));
-	assert.equal(pinned.byName("bg_wait"), undefined);
+	assert.equal(agentCatalog.byName("Agent")?.protected, false);
+	const control = tool("control_hook", "npm:example");
+	agentCatalog.refresh([control], new Set([control.name]), new Map());
+	assert.equal(agentCatalog.byName("control_hook")?.policy, "deferred");
+	assert.equal(agentCatalog.byName("control_hook")?.protected, false);
 });
 
 test("npm and explicit child paths share identity, while distinct local providers do not", () => {
@@ -222,3 +235,4 @@ test("request audit fingerprints stable prefix sections and historical inline po
 	assert.match(audit.observe({ ...loaded, input: [...payload.input, ...loaded.input] }), /historical inline definitions changed/);
 	assert.doesNotMatch(audit.status(), /"Role"|"task"/);
 });
+

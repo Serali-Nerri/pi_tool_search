@@ -11,7 +11,6 @@ import {
 	policyRecordKey,
 	ToolCatalog,
 	TOOL_SEARCH_NAME,
-	toolSourceIdentity,
 	type ToolPolicy,
 } from "./registry.ts";
 import { createToolSearchDefinition } from "./tool.ts";
@@ -82,25 +81,12 @@ export async function saveToolSearchConfiguration(
 	catalog: ToolCatalog,
 	selected: ReadonlyMap<string, ToolPolicy>,
 ): Promise<{ path: string; records: ReturnType<ToolCatalog["policyRecords"]>; changedNames: Set<string> }> {
-	const records = catalog
-		.all()
-		.filter((entry) => !entry.protected)
-		.map((entry) => ({
-			name: entry.tool.name,
-			source: toolSourceIdentity(entry.tool),
-			policy: selected.get(entry.key) ?? entry.policy,
-		}));
+	const records = catalog.policyRecords(selected);
 	const path = await saveToolSearchPolicies(cwd, records);
 	return { path, records, changedNames: catalog.applyPolicies(selected) };
 }
 
-export interface ToolSearchOptions {
-	/** Role-specific pins, applied only to tools already registered and allowed by Pi. */
-	alwaysTools?: readonly string[];
-}
-
-export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath: string, options: ToolSearchOptions = {}): void {
-	const alwaysTools = new Set(options.alwaysTools ?? []);
+export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath: string): void {
 	let catalog = new ToolCatalog();
 	let savedPolicies = new Map<string, ToolPolicy>();
 	let projectPolicies = new Map<string, ToolPolicy>();
@@ -220,7 +206,7 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 	};
 
 	const refreshCatalog = (): boolean =>
-		catalog.refresh(pi.getAllTools(), new Set(pi.getActiveTools()), savedPolicies, projectPolicies, alwaysTools);
+		catalog.refresh(pi.getAllTools(), new Set(pi.getActiveTools()), savedPolicies, projectPolicies);
 
 	const restoreForContext = (context: ExtensionContext): void => {
 		const sessionManager = context.sessionManager as typeof context.sessionManager & {

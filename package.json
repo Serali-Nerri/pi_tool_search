@@ -15,9 +15,7 @@
     "check": "tsc -p tsconfig.json",
     "test": "tsx --test test/*.test.ts",
     "verify": "npm run check && npm test",
-    "deploy": "npm run verify && node scripts/deploy.mjs",
-    "test:subagents": "tsx scripts/probe-subagents.mts",
-    "configure:subagents": "node scripts/configure-subagents.mjs"
+    "deploy": "npm run verify && node scripts/deploy.mjs"
   },
   "pi": {
     "extensions": [

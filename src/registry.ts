@@ -18,12 +18,14 @@ export interface ToolCatalogEntry {
 }
 
 export const TOOL_SEARCH_NAME = "tool_search";
-export const BASE_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
 // Invariant: this set IS the lock set. Every member is forced always and
 // immutable in the config UI; everything else is user-configurable. Keep it
-// to tools that must stay visible (base tools + the loader itself).
-export const PROTECTED_TOOL_NAMES = new Set<string>([...BASE_TOOL_NAMES, TOOL_SEARCH_NAME]);
-export const DEFAULT_EXCLUDED_TOOL_NAMES = new Set(["powershell"]);
+// to the tools that must stay visible: the minimal base set plus the loader.
+export const PROTECTED_TOOL_NAMES = new Set<string>(["read", "bash", "edit", "write", TOOL_SEARCH_NAME]);
+// Plain defaults, not locks: every entry below stays user-configurable in the
+// config UI and JSON. Only PROTECTED_TOOL_NAMES is immutable.
+const DEFAULT_ALWAYS_TOOL_NAMES = new Set(["grep", "find", "ls"]);
+const DEFAULT_EXCLUDED_TOOL_NAMES = new Set(["powershell"]);
 
 // One lookup per winning provider path, never a filesystem walk per request.
 const sourceIdentities = new Map<string, string>();
@@ -57,9 +59,8 @@ export function policyRecordKey(record: Pick<ToolPolicyRecord, "name" | "source"
 }
 
 function defaultPolicy(tool: ToolInfo, initiallyActive: ReadonlySet<string>): ToolPolicy {
-	if (PROTECTED_TOOL_NAMES.has(tool.name)) return "always";
+	if (DEFAULT_ALWAYS_TOOL_NAMES.has(tool.name)) return "always";
 	if (DEFAULT_EXCLUDED_TOOL_NAMES.has(tool.name)) return "excluded";
-	if (tool.name === "bg_wait") return "deferred";
 	return initiallyActive.has(tool.name) ? "deferred" : "excluded";
 }
 
@@ -76,13 +77,12 @@ export class ToolCatalog {
 		initiallyActive: ReadonlySet<string>,
 		savedPolicies: ReadonlyMap<string, ToolPolicy>,
 		projectPolicies: ReadonlyMap<string, ToolPolicy> = new Map(),
-		alwaysTools: ReadonlySet<string> = new Set(),
 	): boolean {
 		const previous = this.signature;
 		const next = new Map<string, ToolCatalogEntry>();
 		for (const tool of tools) {
 			const key = toolKey(tool);
-			const protectedTool = PROTECTED_TOOL_NAMES.has(tool.name) || alwaysTools.has(tool.name);
+			const protectedTool = PROTECTED_TOOL_NAMES.has(tool.name);
 			const existing = this.entriesByKey.get(key);
 			// Legacy source labels (notably "cli") remain readable. New saves use
 			// canonical provider identities shared by parent and explicit child loads.
@@ -133,13 +133,13 @@ export class ToolCatalog {
 		return changedNames;
 	}
 
-	policyRecords(): ToolPolicyRecord[] {
+	policyRecords(overrides?: ReadonlyMap<string, ToolPolicy>): ToolPolicyRecord[] {
 		return this.all()
 			.filter((entry) => !entry.protected)
 			.map((entry) => ({
 				name: entry.tool.name,
 				source: toolSourceIdentity(entry.tool),
-				policy: entry.policy,
+				policy: overrides?.get(entry.key) ?? entry.policy,
 			}));
 	}
 }

@@ -149,6 +149,8 @@ test("catalog defaults every active non-base tool to deferred and inactive tools
 	assert.equal(catalog.byName("web_search")?.policy, "deferred");
 	assert.equal(catalog.byName("document_parse")?.policy, "excluded");
 	assert.equal(catalog.byName("grep")?.policy, "always");
+	assert.equal(catalog.byName("grep")?.protected, false);
+	assert.equal(catalog.byName("read")?.protected, true);
 });
 
 test("saved policies are keyed by source and cannot override protected tools", () => {
@@ -281,15 +283,17 @@ test("configuration labels lock base tools and the loader only", () => {
 	);
 });
 
-test("configuration list sorts builtin tools first, preserving relative order", () => {
+test("configuration list sorts locked rows first, then builtin, preserving relative order", () => {
 	const mixed: ToolCatalogEntry[] = [
 		{ key: "npm:x\u0000zeta", tool: tool("zeta", "npm:x"), policy: "deferred" as const, protected: false },
+		{ key: "builtin\u0000powershell", tool: tool("powershell", "builtin"), policy: "excluded" as const, protected: false },
+		{ key: "src\u0000tool_search", tool: tool("tool_search", "src"), policy: "always" as const, protected: true },
 		{ key: "builtin\u0000write", tool: tool("write", "builtin"), policy: "always" as const, protected: true },
 		{ key: "auto\u0000Agent", tool: tool("Agent", "auto"), policy: "always" as const, protected: false },
 		{ key: "builtin\u0000bash", tool: tool("bash", "builtin"), policy: "always" as const, protected: true },
 	];
 	const sorted = sortConfigEntries(mixed).map((entry) => entry.tool.name);
-	assert.deepEqual(sorted, ["write", "bash", "zeta", "Agent"]);
+	assert.deepEqual(sorted, ["write", "bash", "tool_search", "powershell", "zeta", "Agent"]);
 });
 
 test("a failed policy save leaves the in-memory catalog unchanged", async () => {
