@@ -252,6 +252,49 @@ test("tool configuration labels use the actual winning source", () => {
 	assert.equal(toolSearchEntryLabel(external, "/extension/pi-tool-search/index.ts"), "npm:override · read 🔒");
 });
 
+test("configuration labels lock base tools and user-configured tools only", () => {
+	const agent: ToolCatalogEntry = {
+		key: "auto\u0000Agent",
+		tool: tool("Agent", "auto"),
+		policy: "always" as const,
+		protected: true,
+	};
+	// Protected by code but neither base nor configured: no lock.
+	assert.equal(toolSearchEntryLabel(agent, "/extension/pi-tool-search/index.ts"), "auto · Agent");
+	// Base tools stay locked without any configuration.
+	const read: ToolCatalogEntry = {
+		key: "builtin\u0000read",
+		tool: tool("read", "builtin"),
+		policy: "always" as const,
+		protected: true,
+	};
+	assert.equal(toolSearchEntryLabel(read, "/extension/pi-tool-search/index.ts"), "builtin · read 🔒");
+	// User-configured tools (e.g. mcp set to always) get the lock.
+	const configured = new Set(["auto\u0000Agent", "npm:pi-mcp-adapter\u0000mcp"]);
+	assert.equal(
+		toolSearchEntryLabel(agent, "/extension/pi-tool-search/index.ts", configured),
+		"auto · Agent 🔒",
+	);
+	const mcp: ToolCatalogEntry = {
+		key: "npm:pi-mcp-adapter\u0000mcp",
+		tool: tool("mcp", "npm:pi-mcp-adapter"),
+		policy: "always" as const,
+		protected: false,
+	};
+	assert.equal(
+		toolSearchEntryLabel(mcp, "/extension/pi-tool-search/index.ts", configured),
+		"npm:pi-mcp-adapter · mcp 🔒",
+	);
+	// Unconfigured, non-base tools stay unlocked.
+	const process: ToolCatalogEntry = {
+		key: "auto\u0000process",
+		tool: tool("process", "auto"),
+		policy: "deferred" as const,
+		protected: false,
+	};
+	assert.equal(toolSearchEntryLabel(process, "/extension/pi-tool-search/index.ts", configured), "auto · process");
+});
+
 test("a failed policy save leaves the in-memory catalog unchanged", async () => {
 	const cwd = await mkdtemp(join(tmpdir(), "pi-tool-search-save-failure-"));
 	try {

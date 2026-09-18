@@ -405,7 +405,8 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 				}
 				refreshCatalog();
 				const before = new Map(catalog.all().map((entry) => [entry.key, entry.policy]));
-				const selected = await showToolSearchConfig(context, catalog.all(), extensionPath);
+				const configuredKeys = new Set([...savedPolicies.keys(), ...projectPolicies.keys()]);
+				const selected = await showToolSearchConfig(context, catalog.all(), extensionPath, configuredKeys);
 				if (!selected) return;
 				let saved: Awaited<ReturnType<typeof saveToolSearchConfiguration>>;
 				try {

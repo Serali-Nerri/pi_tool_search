@@ -3,21 +3,31 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
 import { shortToolDescription } from "./manifest.ts";
-import type { ToolCatalogEntry, ToolPolicy } from "./registry.ts";
+import { BASE_TOOL_NAMES, type ToolCatalogEntry, type ToolPolicy } from "./registry.ts";
 
 const POLICY_VALUES: ToolPolicy[] = ["always", "deferred", "excluded"];
+const BASE_TOOL_NAME_SET = new Set<string>(BASE_TOOL_NAMES);
 
-export function toolSearchEntryLabel(entry: ToolCatalogEntry, extensionPath: string): string {
+export function toolSearchEntryLabel(
+	entry: ToolCatalogEntry,
+	extensionPath: string,
+	configuredKeys: ReadonlySet<string> = new Set(),
+): string {
 	const owner = resolve(entry.tool.sourceInfo.path) === resolve(extensionPath)
 		? "pi-tool-search"
 		: entry.tool.sourceInfo.source;
-	return `${owner} · ${entry.tool.name}${entry.protected ? " 🔒" : ""}`;
+	// The lock marks base tools (hardcoded) and tools the user pinned via
+	// configuration. Behavioral protection (entry.protected) is separate and
+	// intentionally unmarked.
+	const locked = BASE_TOOL_NAME_SET.has(entry.tool.name) || configuredKeys.has(entry.key);
+	return `${owner} · ${entry.tool.name}${locked ? " 🔒" : ""}`;
 }
 
 export async function showToolSearchConfig(
 	context: ExtensionCommandContext,
 	entries: readonly ToolCatalogEntry[],
 	extensionPath: string,
+	configuredKeys: ReadonlySet<string> = new Set(),
 ): Promise<Map<string, ToolPolicy> | undefined> {
 	if (context.mode !== "tui") {
 		context.ui.notify("/tool-search config requires TUI mode", "error");
@@ -27,7 +37,7 @@ export async function showToolSearchConfig(
 	return context.ui.custom<Map<string, ToolPolicy> | undefined>((tui, theme, _keybindings, done) => {
 		const items: SettingItem[] = entries.map((entry) => ({
 			id: entry.key,
-			label: toolSearchEntryLabel(entry, extensionPath),
+			label: toolSearchEntryLabel(entry, extensionPath, configuredKeys),
 			description: shortToolDescription(entry.tool.description),
 			currentValue: entry.policy,
 			values: entry.protected ? ["always"] : POLICY_VALUES,
