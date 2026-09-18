@@ -37,7 +37,7 @@ test("capabilities use declared resolved-model protocol flags, never model-name 
 
 test("seven-tool and control defaults apply only to registered tools, including legacy exclusions", () => {
 	const catalog = new ToolCatalog();
-	const names = [...BASE_TOOL_NAMES, "tool_search", "contact_supervisor", "structured_output"];
+	const names = [...BASE_TOOL_NAMES, "tool_search"];
 	const tools = names.map((name) => tool(name));
 	catalog.refresh(tools, new Set(), new Map(tools.map((value) => [toolKey(value), "excluded"])));
 	assert.ok(catalog.all().every((value) => value.policy === "always" && value.protected));

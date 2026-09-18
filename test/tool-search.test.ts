@@ -252,14 +252,14 @@ test("tool configuration labels use the actual winning source", () => {
 	assert.equal(toolSearchEntryLabel(external, "/extension/pi-tool-search/index.ts"), "npm:override · read 🔒");
 });
 
-test("configuration labels lock the seven base tools only", () => {
+test("configuration labels lock base tools and the loader only", () => {
 	const agent: ToolCatalogEntry = {
 		key: "auto\u0000Agent",
 		tool: tool("Agent", "auto"),
 		policy: "always" as const,
-		protected: true,
+		protected: false,
 	};
-	// Protected by code but not a base tool: no lock.
+	// User-configurable tools carry no lock even when pinned always by config.
 	assert.equal(toolSearchEntryLabel(agent, "/extension/pi-tool-search/index.ts"), "auto · Agent");
 	const search: ToolCatalogEntry = {
 		key: "pi-tool-search\u0000tool_search",

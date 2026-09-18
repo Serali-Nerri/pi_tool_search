@@ -19,9 +19,10 @@ export interface ToolCatalogEntry {
 
 export const TOOL_SEARCH_NAME = "tool_search";
 export const BASE_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
-export const PROTECTED_TOOL_NAMES = new Set<string>([
-	...BASE_TOOL_NAMES, TOOL_SEARCH_NAME, "contact_supervisor", "structured_output",
-]);
+// Invariant: this set IS the lock set. Every member is forced always and
+// immutable in the config UI; everything else is user-configurable. Keep it
+// to tools that must stay visible (base tools + the loader itself).
+export const PROTECTED_TOOL_NAMES = new Set<string>([...BASE_TOOL_NAMES, TOOL_SEARCH_NAME]);
 export const DEFAULT_EXCLUDED_TOOL_NAMES = new Set(["powershell"]);
 
 // One lookup per winning provider path, never a filesystem walk per request.
