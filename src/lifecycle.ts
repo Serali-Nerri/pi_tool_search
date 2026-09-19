@@ -3,6 +3,7 @@ import { sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
 import {
 	loadEffectiveToolSearchPolicies,
 	loadToolSearchPolicies,
+	saveGlobalToolSearchPolicies,
 	saveToolSearchPolicies,
 	type LoadedToolSearchPolicies,
 } from "./config.ts";
@@ -12,6 +13,7 @@ import {
 	ToolCatalog,
 	TOOL_SEARCH_NAME,
 	type ToolPolicy,
+	type ToolPolicyRecord,
 } from "./registry.ts";
 import { createToolSearchDefinition } from "./tool.ts";
 import { showToolSearchConfig } from "./ui.ts";
@@ -21,7 +23,6 @@ import { hasStandardToolMetadata, stabilizeToolMetadata, TOOLS_BLOCK_END, TOOLS_
 import { RequestAudit } from "./audit.ts";
 
 const TOOL_SEARCH_STATE_ENTRY = "pi-tool-search.state";
-const LEGACY_TOOL_SEARCH_STATE_ENTRY = "claude-style-tools.tool-search";
 const TOOL_SEARCH_CORRECTIONS_ENTRY = "pi-tool-search.activation-corrections";
 
 interface RestoredState {
@@ -36,10 +37,7 @@ function restoredState(entries: readonly SessionEntry[]): RestoredState {
 	let savedLoaded: string[] = [];
 	let savedKeys: string[] = [];
 	for (const [index, entry] of entries.entries()) {
-		if (
-			entry.type !== "custom" ||
-			(entry.customType !== TOOL_SEARCH_STATE_ENTRY && entry.customType !== LEGACY_TOOL_SEARCH_STATE_ENTRY)
-		) continue;
+		if (entry.type !== "custom" || entry.customType !== TOOL_SEARCH_STATE_ENTRY) continue;
 		const value = entry.data as { enabled?: unknown; loaded?: unknown; loadedKeys?: unknown } | undefined;
 		if (typeof value?.enabled === "boolean") {
 			enabled = value.enabled;
@@ -80,10 +78,13 @@ export async function saveToolSearchConfiguration(
 	cwd: string,
 	catalog: ToolCatalog,
 	selected: ReadonlyMap<string, ToolPolicy>,
-): Promise<{ path: string; records: ReturnType<ToolCatalog["policyRecords"]>; changedNames: Set<string> }> {
-	const records = catalog.policyRecords(selected);
-	const path = await saveToolSearchPolicies(cwd, records);
-	return { path, records, changedNames: catalog.applyPolicies(selected) };
+	scope: "global" | "project" = "global",
+): Promise<{ path: string; records: ToolPolicyRecord[]; changedNames: Set<string>; skipped: number }> {
+	const candidates = catalog.policyRecords(selected);
+	const saved = scope === "global"
+		? await saveGlobalToolSearchPolicies(candidates)
+		: await saveToolSearchPolicies(cwd, candidates);
+	return { ...saved, changedNames: catalog.applyPolicies(selected) };
 }
 
 export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath: string): void {
@@ -358,9 +359,9 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 	});
 
 	pi.registerCommand("tool-search", {
-		description: "Configure deferred tools or inspect request fingerprints: /tool-search [config|on|off|status|audit on|audit off|audit status]",
+		description: "Configure deferred tools or inspect request fingerprints: /tool-search [config|config project|on|off|status|audit on|audit off|audit status]",
 		getArgumentCompletions(prefix) {
-			return ["config", "on", "off", "status", "audit on", "audit off", "audit status"]
+			return ["config", "config project", "on", "off", "status", "audit on", "audit off", "audit status"]
 				.filter((value) => value.startsWith(prefix.trim().toLowerCase()))
 				.map((value) => ({ value, label: value }));
 		},
@@ -377,16 +378,17 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 				context.ui.notify(`Request audit ${auditEnabled ? "on" : "off"}: ${audit.status()}. Structural checks do not measure server cache hits.`, "info");
 				return;
 			}
-			if (!new Set(["config", "on", "off", "status"]).has(action)) {
-				context.ui.notify("Usage: /tool-search [config|on|off|status|audit on|audit off|audit status]", "warning");
+			if (!new Set(["config", "config project", "on", "off", "status"]).has(action)) {
+				context.ui.notify("Usage: /tool-search [config|config project|on|off|status|audit on|audit off|audit status]", "warning");
 				return;
 			}
 			if (action !== "status" && !context.isIdle()) {
 				context.ui.notify("Wait for the current agent turn to finish before changing tool-search mode.", "warning");
 				return;
 			}
-			if (action === "config") {
-				if (!context.isProjectTrusted()) {
+			if (action === "config" || action === "config project") {
+				const scope = action === "config project" ? "project" : "global";
+				if (scope === "project" && !context.isProjectTrusted()) {
 					context.ui.notify("Project-local tool-search policy is unavailable until this project is trusted.", "warning");
 					return;
 				}
@@ -396,21 +398,43 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 				if (!selected) return;
 				let saved: Awaited<ReturnType<typeof saveToolSearchConfiguration>>;
 				try {
-					saved = await saveToolSearchConfiguration(cwd, catalog, selected);
+					saved = await saveToolSearchConfiguration(cwd, catalog, selected, scope);
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
 					context.ui.notify(`Failed to save tool-search policy: ${message}`, "error");
 					return;
 				}
-				const { path, records, changedNames } = saved;
+				const { path, records, changedNames, skipped } = saved;
 				for (const name of changedNames) loaded.delete(name);
-				savedPolicies = new Map(records.map((record) => [policyRecordKey(record), record.policy]));
-				projectPolicies = savedPolicies;
+				const savedLayer = new Map(records.map((record) => [policyRecordKey(record), record.policy]));
+				if (scope === "global") savedPolicies = savedLayer;
+				else projectPolicies = savedLayer;
+				// Re-derive effective policies from the updated layers: a project
+				// record still wins over a just-saved global one.
+				refreshCatalog();
 				registerLoader();
 				applyMode();
 				pi.appendEntry(TOOL_SEARCH_STATE_ENTRY, { enabled, loaded: [...loaded.keys()], loadedKeys: [...loaded.values()] });
 				const changed = [...selected].filter(([key, policy]) => before.get(key) !== policy).length;
 				context.ui.notify(`Saved ${changed} tool policy change${changed === 1 ? "" : "s"} to ${path}.`, "info");
+				if (skipped > 0) {
+					context.ui.notify(
+						`${skipped} tool policy record(s) not saved: reserved separator in name/source. They apply in memory only for this session.`,
+						"warning",
+					);
+				}
+				if (scope === "global") {
+					const overridden = [...selected].filter(([key, policy]) => {
+						const entry = catalog.byKey(key);
+						return entry && !entry.protected && entry.policy !== policy;
+					}).length;
+					if (overridden > 0) {
+						context.ui.notify(
+							`${overridden} saved change${overridden === 1 ? " is" : "s are"} overridden by project-level records and will not take effect in this project.`,
+							"warning",
+						);
+					}
+				}
 				return;
 			}
 			if (action === "on" || action === "off") {

@@ -86,12 +86,17 @@ export function isOwnedBy(
 }
 
 /** Deterministic code-point ordering: identical on every machine and locale. */
-function compareStrings(left: string, right: string): number {
+export function compareStrings(left: string, right: string): number {
 	return left < right ? -1 : left > right ? 1 : 0;
 }
 
 export function policyRecordKey(record: Pick<ToolPolicyRecord, "name" | "source">): string {
 	return `${record.source}\u0000${record.name}`;
+}
+
+/** The NUL byte is the composite-key separator: a record carrying it could alias another tool's policy. */
+export function hasReservedToolKeyPart(record: Pick<ToolPolicyRecord, "name" | "source">): boolean {
+	return record.name.includes("\u0000") || record.source.includes("\u0000");
 }
 
 function defaultPolicy(tool: ToolInfo, initiallyActive: ReadonlySet<string>): ToolPolicy {
@@ -100,29 +105,60 @@ function defaultPolicy(tool: ToolInfo, initiallyActive: ReadonlySet<string>): To
 	return initiallyActive.has(tool.name) ? "deferred" : "excluded";
 }
 
-function safeEntrySignature(entry: ToolCatalogEntry): string {
+// Identity tokens keep reassignment of an unserializable field detectable
+// without serializing it: a fresh object gets a fresh token.
+const fallbackTokens = new WeakMap<object, number>();
+let nextFallbackToken = 0;
+
+function fieldSignature(value: unknown): string {
 	try {
-		return JSON.stringify([entry.key, entry.policy, entry.tool.description, entry.tool.parameters, entry.tool.promptGuidelines]);
-	} catch {
-		// Circular schemas or BigInt params must not break every lifecycle hook.
-		return [entry.key, entry.policy, String(entry.tool.description ?? "")].join("\u0000");
+		const serialized = JSON.stringify(value);
+		if (serialized !== undefined) return serialized;
+	} catch { /* Circular schemas or BigInt params fall through to the token. */ }
+	if ((typeof value === "object" && value !== null) || typeof value === "function") {
+		let token = fallbackTokens.get(value);
+		if (token === undefined) {
+			token = ++nextFallbackToken;
+			fallbackTokens.set(value, token);
+		}
+		return `\u0000token:${token}`;
 	}
+	return String(value);
+}
+
+function safeEntrySignature(entry: ToolCatalogEntry): string {
+	// Per-field demotion: only the unserializable field degrades to its
+	// identity token; the other fields keep full change detection.
+	return [
+		entry.key,
+		entry.policy,
+		fieldSignature(entry.tool.description),
+		fieldSignature(entry.tool.parameters),
+		fieldSignature(entry.tool.promptGuidelines),
+	].join("\u0000");
+}
+
+interface SignatureSnapshot {
+	description: unknown;
+	parameters: unknown;
+	promptGuidelines: unknown;
+	policy: ToolPolicy;
+	signature: string;
+}
+
+type CatalogEntry = ToolCatalogEntry & { snapshot: SignatureSnapshot };
+
+function compareEntries(left: CatalogEntry, right: CatalogEntry): number {
+	return Number(right.protected) - Number(left.protected)
+		|| compareStrings(left.tool.sourceInfo.source, right.tool.sourceInfo.source)
+		|| compareStrings(left.tool.name, right.tool.name);
 }
 
 export class ToolCatalog {
-	private entriesByKey = new Map<string, ToolCatalogEntry>();
+	private entriesByKey = new Map<string, CatalogEntry>();
+	private sortedEntries: CatalogEntry[] = [];
+	private entriesByName = new Map<string, CatalogEntry>();
 	private signature = "";
-	// Snapshot per key: field references are captured at cache time so that
-	// in-place reassignment (tool.parameters = ...) is still detected. Only
-	// deep mutation inside a retained object would slip through, which neither
-	// Pi providers nor this extension perform.
-	private signatureParts = new Map<string, {
-		description: unknown;
-		parameters: unknown;
-		promptGuidelines: unknown;
-		policy: ToolPolicy;
-		signature: string;
-	}>();
 
 	refresh(
 		tools: readonly ToolInfo[],
@@ -131,78 +167,64 @@ export class ToolCatalog {
 		projectPolicies: ReadonlyMap<string, ToolPolicy> = new Map(),
 	): boolean {
 		const previous = this.signature;
-		const next = new Map<string, ToolCatalogEntry>();
-		const nextParts = new Map<string, {
-			description: unknown;
-			parameters: unknown;
-			promptGuidelines: unknown;
-			policy: ToolPolicy;
-			signature: string;
-		}>();
+		const next = new Map<string, CatalogEntry>();
 		for (const tool of tools) {
 			const key = toolKey(tool);
 			const protectedTool = PROTECTED_TOOL_NAMES.has(tool.name);
 			const existing = this.entriesByKey.get(key);
-			// Legacy source labels (notably "cli") remain readable. New saves use
-			// canonical provider identities shared by parent and explicit child loads.
-			const configured = projectPolicies.get(key)
-				?? projectPolicies.get(`${tool.sourceInfo.source}\u0000${tool.name}`)
-				?? savedPolicies.get(key)
-				?? savedPolicies.get(`${tool.sourceInfo.source}\u0000${tool.name}`);
+			const configured = projectPolicies.get(key) ?? savedPolicies.get(key);
 			const policy = protectedTool
 				? "always"
 				: configured ?? existing?.policy ?? defaultPolicy(tool, initiallyActive);
-			const entry: ToolCatalogEntry = { key, tool, policy, protected: protectedTool };
-			next.set(key, entry);
 			// Reuse the cached signature when nothing it covers changed: the
 			// snapshot holds the previous field references, so any reassigned
 			// description/schema/guidelines object (or a policy change) misses
 			// the cache. Steady state is O(n) reference comparisons instead of
 			// re-serializing every JSON schema on every turn.
-			const cached = this.signatureParts.get(key);
-			const reusable = cached
+			const cached = existing?.snapshot;
+			const signature = cached
 				&& cached.description === tool.description
 				&& cached.parameters === tool.parameters
 				&& cached.promptGuidelines === tool.promptGuidelines
 				&& cached.policy === policy
 				? cached.signature
-				: undefined;
-			const signature = reusable ?? safeEntrySignature(entry);
-			nextParts.set(key, {
-				description: tool.description,
-				parameters: tool.parameters,
-				promptGuidelines: tool.promptGuidelines,
+				: safeEntrySignature({ key, tool, policy, protected: protectedTool });
+			// The snapshot lives on the entry so refresh() and applyPolicies()
+			// update a single structure; only deep mutation inside a retained
+			// object slips through, which neither Pi providers nor this
+			// extension perform.
+			next.set(key, {
+				key,
+				tool,
 				policy,
-				signature,
+				protected: protectedTool,
+				snapshot: {
+					description: tool.description,
+					parameters: tool.parameters,
+					promptGuidelines: tool.promptGuidelines,
+					policy,
+					signature,
+				},
 			});
 		}
 		this.entriesByKey = next;
-		this.signatureParts = nextParts;
-		const current = [...nextParts.values()].map((part) => part.signature).sort().join("\n");
+		const ordered = [...next.values()].sort(compareEntries);
+		this.sortedEntries = ordered;
+		// Single-winner rule: the last entry in all() order wins by Map
+		// overwrite, matching applyMode's name map. Policy changes do not
+		// affect ordering keys, so the index survives applyPolicies().
+		this.entriesByName = new Map(ordered.map((entry) => [entry.tool.name, entry]));
+		const current = ordered.map((entry) => entry.snapshot.signature).sort(compareStrings).join("\n");
 		this.signature = current;
 		return previous !== current;
 	}
 
 	all(): ToolCatalogEntry[] {
-		return [...this.entriesByKey.values()].sort(
-			(left, right) =>
-				Number(right.protected) - Number(left.protected) ||
-				compareStrings(left.tool.sourceInfo.source, right.tool.sourceInfo.source) ||
-				compareStrings(left.tool.name, right.tool.name),
-		);
+		return [...this.sortedEntries];
 	}
 
 	byName(name: string): ToolCatalogEntry | undefined {
-		// Single-winner rule shared with the full-order name map in applyMode:
-		// last entry in all() order wins. The loader (tool.ts) matches within
-		// the deferred subset instead, so a cross-policy duplicate can be
-		// advertised yet rejected by activate(); execute() reports that case
-		// explicitly instead of answering "No deferred tools were loaded."
-		const entries = this.all();
-		for (let index = entries.length - 1; index >= 0; index--) {
-			if (entries[index].tool.name === name) return entries[index];
-		}
-		return undefined;
+		return this.entriesByName.get(name);
 	}
 
 	byKey(key: string): ToolCatalogEntry | undefined {
@@ -210,7 +232,7 @@ export class ToolCatalog {
 	}
 
 	withPolicy(policy: ToolPolicy): ToolCatalogEntry[] {
-		return this.all().filter((entry) => entry.policy === policy);
+		return this.sortedEntries.filter((entry) => entry.policy === policy);
 	}
 
 	applyPolicies(policies: ReadonlyMap<string, ToolPolicy>): Set<string> {
@@ -222,15 +244,12 @@ export class ToolCatalog {
 			// Keep the signature snapshot in sync: refresh() reuses a cached
 			// signature only when cached.policy matches, so a stale snapshot
 			// would force a spurious change on the next refresh.
-			const part = this.signatureParts.get(key);
-			if (part) {
-				part.policy = policy;
-				part.signature = safeEntrySignature(entry);
-			}
+			entry.snapshot.policy = policy;
+			entry.snapshot.signature = safeEntrySignature(entry);
 			changedNames.add(entry.tool.name);
 		}
 		if (changedNames.size > 0) {
-			this.signature = [...this.signatureParts.values()].map((part) => part.signature).sort().join("\n");
+			this.signature = this.sortedEntries.map((entry) => entry.snapshot.signature).sort(compareStrings).join("\n");
 		}
 		return changedNames;
 	}

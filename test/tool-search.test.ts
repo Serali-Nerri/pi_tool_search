@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { CONFIG_DIR_NAME, type ToolInfo } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
-	legacyToolSearchConfigPath,
+	globalToolSearchConfigPath,
 	loadToolSearchPolicies,
+	saveGlobalToolSearchPolicies,
 	saveToolSearchPolicies,
 	toolSearchConfigPath,
 	TOOL_SEARCH_CONFIG_MAX_BYTES,
@@ -173,9 +174,10 @@ test("project policy files round-trip without touching Pi settings", async () =>
 			{ name: "web_search", source: "npm:pi-web-access", policy: "deferred" as const },
 			{ name: "document_parse", source: "npm:pi-docparser", policy: "always" as const },
 		];
-		const path = await saveToolSearchPolicies(cwd, records);
-		assert.equal(path, join(cwd, CONFIG_DIR_NAME, "pi-tool-search.json"));
-		assert.equal(path, toolSearchConfigPath(cwd));
+		const saved = await saveToolSearchPolicies(cwd, records);
+		assert.equal(saved.path, join(cwd, CONFIG_DIR_NAME, "pi-tool-search.json"));
+		assert.equal(saved.path, toolSearchConfigPath(cwd));
+		assert.equal(saved.skipped, 0);
 		const loaded = await loadToolSearchPolicies(cwd);
 		assert.equal(loaded.policies.get(policyRecordKey(records[0])), "deferred");
 		assert.equal(loaded.policies.get(policyRecordKey(records[1])), "always");
@@ -184,15 +186,14 @@ test("project policy files round-trip without touching Pi settings", async () =>
 	}
 });
 
-test("legacy claude-style-tools policies remain readable after the split", async () => {
+test("legacy claude-style-tools policy files are no longer read", async () => {
 	const cwd = await mkdtemp(join(tmpdir(), "pi-tool-search-legacy-config-"));
 	try {
 		const record = { name: "web_search", source: "npm:pi-web-access", policy: "always" as const };
-		const path = legacyToolSearchConfigPath(cwd);
-		await mkdir(dirname(path), { recursive: true });
-		await writeFile(path, JSON.stringify({ version: 1, tools: [record] }));
+		await mkdir(join(cwd, CONFIG_DIR_NAME), { recursive: true });
+		await writeFile(join(cwd, CONFIG_DIR_NAME, "claude-style-tools.json"), JSON.stringify({ version: 1, tools: [record] }));
 		const loaded = await loadToolSearchPolicies(cwd);
-		assert.equal(loaded.policies.get(policyRecordKey(record)), "always");
+		assert.equal(loaded.policies.size, 0);
 	} finally {
 		await rm(cwd, { recursive: true, force: true });
 	}
@@ -242,15 +243,37 @@ test("policy saves cannot create a file that the bounded loader will reject", as
 	}
 });
 
-test("policy saves reject NUL bytes that the loader would skip", async () => {
+test("policy saves skip NUL-bearing records the loader would ignore", async () => {
 	const cwd = await mkdtemp(join(tmpdir(), "pi-tool-search-nul-save-"));
 	try {
-		await assert.rejects(
-			saveToolSearchPolicies(cwd, [{ name: "a\u0000b", source: "x", policy: "always" }]),
-			/NUL/,
-		);
+		const good = { name: "web_search", source: "npm:pi-web-access", policy: "always" as const };
+		const saved = await saveToolSearchPolicies(cwd, [good, { name: "a\u0000b", source: "x", policy: "deferred" }]);
+		assert.equal(saved.skipped, 1);
+		assert.deepEqual(saved.records, [good]);
+		const loaded = await loadToolSearchPolicies(cwd);
+		assert.equal(loaded.policies.size, 1);
+		assert.equal(loaded.policies.get(policyRecordKey(good)), "always");
 	} finally {
 		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("global policy saves write the agent-dir file and preserve its mode and audit", async () => {
+	const agentDir = await mkdtemp(join(tmpdir(), "pi-tool-search-global-save-"));
+	try {
+		await writeFile(
+			globalToolSearchConfigPath(agentDir),
+			JSON.stringify({ version: 1, mode: "eager", audit: true, tools: [] }),
+		);
+		const record = { name: "grep", source: "builtin", policy: "deferred" as const };
+		const saved = await saveGlobalToolSearchPolicies([record], agentDir);
+		assert.equal(saved.path, globalToolSearchConfigPath(agentDir));
+		const written = JSON.parse(await readFile(saved.path, "utf8"));
+		assert.equal(written.mode, "eager");
+		assert.equal(written.audit, true);
+		assert.deepEqual(written.tools, [record]);
+	} finally {
+		await rm(agentDir, { recursive: true, force: true });
 	}
 });
 
@@ -333,7 +356,7 @@ test("a failed policy save leaves the in-memory catalog unchanged", async () => 
 		catalog.refresh([web], new Set([web.name]), new Map());
 		const entry = catalog.byName(web.name);
 		assert.ok(entry);
-		await assert.rejects(saveToolSearchConfiguration(cwd, catalog, new Map([[entry.key, "always"]])));
+		await assert.rejects(saveToolSearchConfiguration(cwd, catalog, new Map([[entry.key, "always"]]), "project"));
 		assert.equal(catalog.byName(web.name)?.policy, "deferred");
 	} finally {
 		await rm(cwd, { recursive: true, force: true });

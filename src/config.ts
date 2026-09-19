@@ -3,6 +3,7 @@ import { mkdir, open, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
+	hasReservedToolKeyPart,
 	policyRecordKey,
 	type ToolPolicy,
 	type ToolPolicyRecord,
@@ -10,7 +11,6 @@ import {
 
 const CONFIG_VERSION = 1;
 const CONFIG_FILE_NAME = "pi-tool-search.json";
-const LEGACY_CONFIG_FILE_NAME = "claude-style-tools.json";
 export const TOOL_SEARCH_CONFIG_MAX_BYTES = 64 * 1024;
 const VALID_POLICIES = new Set<ToolPolicy>(["always", "deferred", "excluded"]);
 
@@ -33,8 +33,8 @@ export function toolSearchConfigPath(cwd: string): string {
 	return join(cwd, CONFIG_DIR_NAME, CONFIG_FILE_NAME);
 }
 
-export function legacyToolSearchConfigPath(cwd: string): string {
-	return join(cwd, CONFIG_DIR_NAME, LEGACY_CONFIG_FILE_NAME);
+export function globalToolSearchConfigPath(agentDir = getAgentDir()): string {
+	return join(agentDir, CONFIG_FILE_NAME);
 }
 
 async function loadToolSearchPoliciesAt(path: string): Promise<LoadedToolSearchPolicies | undefined> {
@@ -82,9 +82,7 @@ async function loadToolSearchPoliciesAt(path: string): Promise<LoadedToolSearchP
 					typeof record.source !== "string" ||
 					!VALID_POLICIES.has(record.policy)
 				) continue;
-				// The NUL byte is our composite-key separator: a record carrying
-				// it could alias another tool's policy, so skip the record.
-				if (record.name.includes("\u0000") || record.source.includes("\u0000")) {
+				if (hasReservedToolKeyPart(record)) {
 					skipped++;
 					continue;
 				}
@@ -111,7 +109,6 @@ async function loadToolSearchPoliciesAt(path: string): Promise<LoadedToolSearchP
 /** Loads only a small, validated project policy file; callers must check trust first. */
 export async function loadToolSearchPolicies(cwd: string): Promise<LoadedToolSearchPolicies> {
 	return await loadToolSearchPoliciesAt(toolSearchConfigPath(cwd))
-		?? await loadToolSearchPoliciesAt(legacyToolSearchConfigPath(cwd))
 		?? { policies: new Map() };
 }
 
@@ -120,7 +117,7 @@ export async function loadEffectiveToolSearchPolicies(
 	trusted: boolean,
 	agentDir = getAgentDir(),
 ): Promise<LoadedToolSearchPolicies> {
-	const global = await loadToolSearchPoliciesAt(join(agentDir, CONFIG_FILE_NAME));
+	const global = await loadToolSearchPoliciesAt(globalToolSearchConfigPath(agentDir));
 	const project = trusted ? await loadToolSearchPolicies(cwd) : undefined;
 	return {
 		policies: new Map([...(global?.policies ?? []), ...(project?.policies ?? [])]),
@@ -131,17 +128,17 @@ export async function loadEffectiveToolSearchPolicies(
 	};
 }
 
-export async function saveToolSearchPolicies(cwd: string, tools: ToolPolicyRecord[]): Promise<string> {
-	const path = toolSearchConfigPath(cwd);
-	// Reject what the loader must skip: a NUL-bearing record would write
-	// successfully yet never round-trip (see loadToolSearchPoliciesAt).
-	for (const record of tools) {
-		if (record.name.includes("\u0000") || record.source.includes("\u0000")) {
-			throw new Error("Tool-search policy records cannot contain NUL bytes in name/source.");
-		}
-	}
-	const previous = await loadToolSearchPolicies(cwd);
-	const config: ToolSearchProjectConfig = { version: CONFIG_VERSION, tools, mode: previous.mode, audit: previous.audit };
+export interface SavedToolSearchPolicies {
+	path: string;
+	/** Records actually written: NUL-bearing records are dropped (the loader would skip them anyway). */
+	records: ToolPolicyRecord[];
+	skipped: number;
+}
+
+async function saveToolSearchPoliciesAt(path: string, tools: ToolPolicyRecord[]): Promise<SavedToolSearchPolicies> {
+	const records = tools.filter((record) => !hasReservedToolKeyPart(record));
+	const previous = await loadToolSearchPoliciesAt(path);
+	const config: ToolSearchProjectConfig = { version: CONFIG_VERSION, tools: records, mode: previous?.mode, audit: previous?.audit };
 	const content = `${JSON.stringify(config, null, 2)}\n`;
 	if (Buffer.byteLength(content, "utf8") > TOOL_SEARCH_CONFIG_MAX_BYTES) {
 		throw new Error(`Tool-search policy exceeds ${TOOL_SEARCH_CONFIG_MAX_BYTES} bytes.`);
@@ -151,9 +148,19 @@ export async function saveToolSearchPolicies(cwd: string, tools: ToolPolicyRecor
 	try {
 		await writeFile(tempPath, content, { encoding: "utf8", flag: "wx", mode: 0o600 });
 		await rename(tempPath, path);
-		return path;
+		return { path, records, skipped: tools.length - records.length };
 	} catch (error) {
 		await rm(tempPath, { force: true }).catch(() => undefined);
 		throw error;
 	}
+}
+
+/** Saves project-scoped policies to <cwd>/.pi/pi-tool-search.json. */
+export async function saveToolSearchPolicies(cwd: string, tools: ToolPolicyRecord[]): Promise<SavedToolSearchPolicies> {
+	return saveToolSearchPoliciesAt(toolSearchConfigPath(cwd), tools);
+}
+
+/** Saves global policies to <agentDir>/pi-tool-search.json — the default scope of /tool-search config. */
+export async function saveGlobalToolSearchPolicies(tools: ToolPolicyRecord[], agentDir = getAgentDir()): Promise<SavedToolSearchPolicies> {
+	return saveToolSearchPoliciesAt(globalToolSearchConfigPath(agentDir), tools);
 }

@@ -3,7 +3,7 @@ import type { Component } from "@earendil-works/pi-tui";
 import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 import { boundedToolSnippet, buildToolSearchDescription, shortToolDescription } from "./manifest.ts";
-import { TOOL_SEARCH_NAME, type ToolCatalogEntry } from "./registry.ts";
+import { compareStrings, TOOL_SEARCH_NAME, type ToolCatalogEntry } from "./registry.ts";
 
 export const TOOL_SEARCH_MAX_RESULTS = 5;
 export const TOOL_GUIDANCE_MAX_BYTES = 8 * 1024;
@@ -274,7 +274,7 @@ export function suggestToolNames(name: string, candidates: readonly string[], li
 		.filter(({ candidate, distance }) =>
 			distance <= Math.max(2, Math.floor(Math.max(normalized.length, candidate.length) * 0.4)),
 		)
-		.sort((left, right) => left.distance - right.distance || left.candidate.localeCompare(right.candidate))
+		.sort((left, right) => left.distance - right.distance || compareStrings(left.candidate, right.candidate))
 		.slice(0, limit)
 		.map(({ candidate }) => candidate);
 }

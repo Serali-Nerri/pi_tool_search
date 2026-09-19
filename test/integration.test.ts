@@ -420,16 +420,70 @@ test("a dynamic loader collision restores only tools hidden by this extension", 
 	assert.equal(harness.getActiveTools().includes("tool_search"), true);
 });
 
-test("restores both legacy and standalone session state", async () => {
-	for (const customType of ["claude-style-tools.tool-search", "pi-tool-search.state"]) {
-		const entries = [
-			{ type: "custom", customType, data: { enabled: true, loaded: ["web_search"] } },
-		];
-		const harness = createHarness({ externalTools });
-		await harness.emitAsync("session_start", { type: "session_start", reason: "resume" }, extensionContext(entries));
-		assert.equal(harness.getActiveTools().includes("web_search"), true);
-		assert.equal(harness.getActiveTools().includes("document_parse"), false);
-	}
+test("restores standalone session state", async () => {
+	const entries = [
+		{ type: "custom", customType: "pi-tool-search.state", data: { enabled: true, loaded: ["web_search"] } },
+	];
+	const harness = createHarness({ externalTools });
+	await harness.emitAsync("session_start", { type: "session_start", reason: "resume" }, extensionContext(entries));
+	assert.equal(harness.getActiveTools().includes("web_search"), true);
+	assert.equal(harness.getActiveTools().includes("document_parse"), false);
+});
+
+test("ignores legacy claude-style-tools session state entries", async () => {
+	const entries = [
+		{ type: "custom", customType: "claude-style-tools.tool-search", data: { enabled: false, loaded: ["web_search"] } },
+	];
+	const harness = createHarness({ externalTools });
+	await harness.emitAsync("session_start", { type: "session_start", reason: "resume" }, extensionContext(entries));
+	// The legacy entry no longer disables the extension nor restores its loaded list.
+	assert.equal(harness.getActiveTools().includes("web_search"), false);
+	assert.equal(harness.getActiveTools().includes("tool_search"), true);
+});
+
+test("session_tree re-restores loaded and enabled state per branch", async () => {
+	const harness = await startHarness({ externalTools });
+	const loadedResult = (toolCallId: string, name: string) => ({
+		type: "message",
+		message: {
+			role: "toolResult",
+			toolCallId,
+			toolName: "tool_search",
+			content: [{ type: "text", text: `Loaded tools: ${name}` }],
+			details: { matches: [name], added: [name], active: [name], unknown: [] },
+			isError: false,
+		},
+	});
+	// Current branch: web_search activated in this session.
+	await harness.tool("tool_search").execute!("load-a", { tool_names: ["web_search"] });
+	assert.equal(harness.getActiveTools().includes("web_search"), true);
+	assert.equal(harness.getActiveTools().includes("document_parse"), false);
+	// Jump to a branch where document_parse was loaded instead: the tool
+	// surface follows the new branch, and the old branch's activation hides.
+	const branchB = [loadedResult("search-b", "document_parse")];
+	await harness.emitAsync("session_tree", { type: "session_tree", newLeafId: "b", oldLeafId: "a" }, extensionContext(branchB));
+	assert.equal(harness.getActiveTools().includes("document_parse"), true);
+	assert.equal(harness.getActiveTools().includes("web_search"), false);
+	assert.equal(harness.getActiveTools().includes("tool_search"), true);
+	// Jump back: web_search returns, document_parse hides again.
+	const branchA = [loadedResult("search-a", "web_search")];
+	await harness.emitAsync("session_tree", { type: "session_tree", newLeafId: "a", oldLeafId: "b" }, extensionContext(branchA));
+	assert.equal(harness.getActiveTools().includes("web_search"), true);
+	assert.equal(harness.getActiveTools().includes("document_parse"), false);
+	// A branch where tool-search was off restores eager mode: every deferred
+	// tool active, loader hidden.
+	const branchOff = [
+		{ type: "custom", customType: "pi-tool-search.state", data: { enabled: false, loaded: [] } },
+	];
+	await harness.emitAsync("session_tree", { type: "session_tree", newLeafId: "c", oldLeafId: "a" }, extensionContext(branchOff));
+	assert.equal(harness.getActiveTools().includes("web_search"), true);
+	assert.equal(harness.getActiveTools().includes("document_parse"), true);
+	assert.equal(harness.getActiveTools().includes("tool_search"), false);
+	// And back to deferred mode with only the branch's own activation.
+	await harness.emitAsync("session_tree", { type: "session_tree", newLeafId: "a2", oldLeafId: "c" }, extensionContext(branchA));
+	assert.equal(harness.getActiveTools().includes("web_search"), true);
+	assert.equal(harness.getActiveTools().includes("document_parse"), false);
+	assert.equal(harness.getActiveTools().includes("tool_search"), true);
 });
 
 test("restores matched tools that were already active during loading", async () => {

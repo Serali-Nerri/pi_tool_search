@@ -36,7 +36,7 @@ test("capabilities use declared resolved-model protocol flags, never model-name 
 	assert.equal(supportsIncrementalTools({ api: "openai-responses", compat: { supportsToolReferences: true } }), false);
 });
 
-test("locked defaults apply only to registered tools and ignore legacy exclusions", () => {
+test("locked defaults apply only to registered tools and ignore saved exclusions", () => {
 	const catalog = new ToolCatalog();
 	const tools = [...PROTECTED_TOOL_NAMES].map((name) => tool(name));
 	catalog.refresh(tools, new Set(), new Map(tools.map((value) => [toolKey(value), "excluded"])));
@@ -63,7 +63,7 @@ test("ordinary tools follow the generic defaults and never lock", () => {
 	catalog.refresh([wait], new Set(["helper"]), new Map());
 	assert.equal(catalog.byName("helper")?.policy, "deferred");
 	assert.equal(catalog.byName("helper")?.protected, false);
-	// Registered but not initially active: the generic subagent rule applies.
+	// Registered but not initially active: excluded by default.
 	const inactive = new ToolCatalog();
 	inactive.refresh([wait], new Set(), new Map());
 	assert.equal(inactive.byName("helper")?.policy, "excluded");
@@ -130,7 +130,7 @@ test("saved document policies do not create tools when the provider is absent or
 	assert.equal(catalog.withPolicy("deferred").length, 0);
 });
 
-test("global defaults and trusted project overrides retain precedence across legacy source labels", async () => {
+test("global defaults and trusted project overrides retain precedence", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-policy-layers-"));
 	try {
 		const agentDir = join(root, "agent");
@@ -138,7 +138,7 @@ test("global defaults and trusted project overrides retain precedence across leg
 		await mkdir(agentDir);
 		await mkdir(join(cwd, ".pi"), { recursive: true });
 		await writeFile(join(agentDir, "pi-tool-search.json"), JSON.stringify({ version: 1, mode: "eager", audit: true, tools: [{ name: "alpha", source: "npm:fixture", policy: "always" }] }));
-		await writeFile(join(cwd, ".pi/pi-tool-search.json"), JSON.stringify({ version: 1, mode: "auto", audit: false, tools: [{ name: "alpha", source: "cli", policy: "deferred" }] }));
+		await writeFile(join(cwd, ".pi/pi-tool-search.json"), JSON.stringify({ version: 1, mode: "auto", audit: false, tools: [{ name: "alpha", source: "npm:fixture", policy: "deferred" }] }));
 		const trusted = await loadEffectiveToolSearchPolicies(cwd, true, agentDir);
 		assert.equal(trusted.mode, "auto");
 		assert.equal(trusted.audit, false);
@@ -275,6 +275,14 @@ test("catalog tolerates unserializable tool schemas without breaking refresh", (
 	(value.parameters as Record<string, unknown>).self = value.parameters;
 	assert.equal(catalog.refresh([value], new Set(["odd"]), new Map()), true);
 	assert.equal(catalog.refresh([value], new Set(["odd"]), new Map()), false);
+	// Only the unserializable field is demoted: reassigning it is still detected.
+	const replacement = tool("odd");
+	(replacement.parameters as Record<string, unknown>).self = replacement.parameters;
+	assert.equal(catalog.refresh([replacement], new Set(["odd"]), new Map()), true);
+	assert.equal(catalog.refresh([replacement], new Set(["odd"]), new Map()), false);
+	// And the other fields keep full change detection for the same tool.
+	replacement.promptGuidelines = ["odd guideline v2"];
+	assert.equal(catalog.refresh([replacement], new Set(["odd"]), new Map()), true);
 });
 
 test("catalog ordering is code-point deterministic, never locale-dependent", () => {
