@@ -11,7 +11,13 @@ export function toolSearchEntryLabel(
 	extensionPath: string,
 	cwd = process.cwd(),
 ): string {
-	const owner = isOwnedBy(entry.tool, extensionPath, cwd)
+	return formatToolSearchEntryLabel(entry, isOwnedBy(entry.tool, extensionPath, cwd));
+}
+
+/** Shared row rendering: callers that already normalized the extension path
+ * pass the ownership verdict directly to avoid re-resolving it per row. */
+function formatToolSearchEntryLabel(entry: ToolCatalogEntry, owned: boolean): string {
+	const owner = owned
 		? "pi-tool-search"
 		: entry.tool.sourceInfo.source;
 	// The lock means exactly one thing: this row cannot be changed (forced
@@ -38,13 +44,18 @@ export async function showToolSearchConfig(
 		return undefined;
 	}
 	const ordered = sortConfigEntries(entries);
-	// Normalize once: the per-row label check must not re-resolve the same path.
+	// Normalize the extension path once: every tool path still needs one
+	// normalization per row (they differ per row), but the constant side of
+	// the comparison must not be re-resolved for every row.
 	const normalizedExtension = normalizeExtensionPath(extensionPath, cwd);
 	const working = new Map(ordered.map((entry) => [entry.key, entry.policy]));
 	return context.ui.custom<Map<string, ToolPolicy> | undefined>((tui, theme, _keybindings, done) => {
 		const items: SettingItem[] = ordered.map((entry) => ({
 			id: entry.key,
-			label: toolSearchEntryLabel(entry, normalizedExtension, cwd),
+			label: formatToolSearchEntryLabel(
+				entry,
+				normalizeExtensionPath(entry.tool.sourceInfo.path, cwd) === normalizedExtension,
+			),
 			description: shortToolDescription(entry.tool.description),
 			currentValue: entry.policy,
 			values: entry.protected ? ["always"] : POLICY_VALUES,

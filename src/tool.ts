@@ -344,9 +344,15 @@ export function createToolSearchDefinition(
 			const activation = options.activate(matches);
 			const { added, active } = activation;
 			const alreadyActive = active.filter((name) => !added.includes(name));
+			// A name advertised from the deferred subset can lose the full-catalog
+			// winner to another provider (see ToolCatalog.byName): activate then
+			// filters it out. Name it explicitly instead of leaving the model
+			// with a manifest entry and a bare "No deferred tools were loaded."
+			const unavailable = matches.filter((name) => !active.includes(name));
 			const lines: string[] = [];
 			if (added.length > 0) lines.push(`Loaded tools: ${added.join(", ")}`);
 			if (alreadyActive.length > 0) lines.push(`Already active: ${alreadyActive.join(", ")}`);
+			for (const name of unavailable) lines.push(`No longer available as a deferred tool: ${name}.`);
 			for (const name of unknown) {
 				const suggestions = suggestToolNames(name, [...byName.keys()]);
 				lines.push(

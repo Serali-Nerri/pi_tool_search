@@ -64,10 +64,14 @@ export function stabilizeToolMetadata(
 		if (snippet !== undefined) tools.push(`- ${entry.tool.name}: ${snippet}`);
 	}
 
-	// Remove only exact, known tool metadata lines in a single pass. Unrecognized
-	// guideline text from another extension is preserved, including changes
-	// between user prompts.
-	let remainder = `${prompt.slice(guideStart + GUIDES_START.length, guideEnd)}\n`;
+	// Remove only exact, known tool metadata blocks. Unrecognized guideline
+	// text from another extension is preserved, including changes between
+	// user prompts. Block matching (not single-line matching) is required: a
+	// promptGuideline may itself contain newlines and Pi renders it verbatim
+	// as `- ${guide}`, so only the whole `- ${trimmed}\n` segment identifies
+	// the stale copy. A per-line set would never equal a multiline block and
+	// would leave the stale copy behind while the rebuilt section re-adds it.
+	let remainder = `\n${prompt.slice(guideStart + GUIDES_START.length, guideEnd)}\n`;
 	const removable = new Set<string>();
 	for (const guide of [
 		...EXPLORATION_GUIDES,
@@ -75,11 +79,12 @@ export function stabilizeToolMetadata(
 		...entries.flatMap((entry) => entry.tool.promptGuidelines ?? []),
 	]) {
 		const trimmed = guide.trim();
-		if (trimmed) removable.add(`- ${trimmed}`);
+		if (trimmed) removable.add(`\n- ${trimmed}\n`);
 	}
-	if (removable.size > 0) {
-		remainder = remainder.split("\n").filter((line) => !removable.has(line)).join("\n");
+	for (const block of removable) {
+		remainder = remainder.replaceAll(block, "\n");
 	}
+	remainder = remainder.slice(1);
 	const guides = new Set<string>();
 	const names = new Set(visible.map((entry) => entry.tool.name));
 	if (!["grep", "find", "ls"].some((name) => names.has(name))) {

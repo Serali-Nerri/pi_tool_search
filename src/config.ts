@@ -74,6 +74,7 @@ async function loadToolSearchPoliciesAt(path: string): Promise<LoadedToolSearchP
 				};
 			}
 			const policies = new Map<string, ToolPolicy>();
+			let skipped = 0;
 			for (const record of parsed.tools) {
 				if (
 					!record ||
@@ -83,10 +84,20 @@ async function loadToolSearchPoliciesAt(path: string): Promise<LoadedToolSearchP
 				) continue;
 				// The NUL byte is our composite-key separator: a record carrying
 				// it could alias another tool's policy, so skip the record.
-				if (record.name.includes("\u0000") || record.source.includes("\u0000")) continue;
+				if (record.name.includes("\u0000") || record.source.includes("\u0000")) {
+					skipped++;
+					continue;
+				}
 				policies.set(policyRecordKey(record), record.policy);
 			}
-			return { policies, mode: parsed.mode, audit: parsed.audit };
+			return {
+				policies,
+				mode: parsed.mode,
+				audit: parsed.audit,
+				diagnostic: skipped > 0
+					? `${skipped} tool policy record(s) ignored: reserved separator in name/source.`
+					: undefined,
+			};
 		} finally {
 			await handle.close();
 		}
@@ -122,6 +133,13 @@ export async function loadEffectiveToolSearchPolicies(
 
 export async function saveToolSearchPolicies(cwd: string, tools: ToolPolicyRecord[]): Promise<string> {
 	const path = toolSearchConfigPath(cwd);
+	// Reject what the loader must skip: a NUL-bearing record would write
+	// successfully yet never round-trip (see loadToolSearchPoliciesAt).
+	for (const record of tools) {
+		if (record.name.includes("\u0000") || record.source.includes("\u0000")) {
+			throw new Error("Tool-search policy records cannot contain NUL bytes in name/source.");
+		}
+	}
 	const previous = await loadToolSearchPolicies(cwd);
 	const config: ToolSearchProjectConfig = { version: CONFIG_VERSION, tools, mode: previous.mode, audit: previous.audit };
 	const content = `${JSON.stringify(config, null, 2)}\n`;

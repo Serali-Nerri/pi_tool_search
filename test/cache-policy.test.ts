@@ -103,6 +103,18 @@ test("catalog detects schema and prompt-guideline changes even when description 
 	assert.equal(catalog.refresh([value], new Set(["a"]), new Map()), false);
 });
 
+test("policy changes applied in memory do not cause a spurious catalog change", () => {
+	const catalog = new ToolCatalog();
+	const value = tool("a");
+	assert.equal(catalog.refresh([value], new Set(["a"]), new Map()), true);
+	assert.equal(catalog.refresh([value], new Set(["a"]), new Map()), false);
+	catalog.applyPolicies(new Map([[toolKey(value), "always"]]));
+	assert.equal(catalog.byName("a")?.policy, "always");
+	// The signature snapshot must follow the in-memory edit, or the next
+	// lifecycle refresh would report a change that never happened.
+	assert.equal(catalog.refresh([value], new Set(["a"]), new Map()), false);
+});
+
 test("saved document policies do not create tools when the provider is absent or removed", () => {
 	const catalog = new ToolCatalog();
 	const parse = tool("document_parse", "npm:pi-docparser");
@@ -158,6 +170,26 @@ test("stable metadata never injects deferred guidelines into the system prompt",
 	assert.doesNotMatch(stable, /alpha guideline/);
 	assert.doesNotMatch(stable, /- alpha:|hidden/);
 	assert.match(stable, /Current project safety instructions/);
+});
+
+test("multiline guidelines are removed as whole blocks, never leaked or duplicated", () => {
+	const multiline = "Use alpha\n  with context";
+	const alpha = tool("alpha");
+	alpha.promptGuidelines = [multiline];
+	const readEntry: ToolCatalogEntry = { key: toolKey(tool("read")), tool: tool("read"), policy: "always", protected: false };
+	const alphaEntry: ToolCatalogEntry = { key: toolKey(alpha), tool: alpha, policy: "deferred", protected: false };
+	const options = { cwd: "/tmp", toolSnippets: { read: "read snippet", alpha: "alpha snippet" } };
+	// Pi renders a multiline guideline verbatim; the continuation line carries no bullet.
+	const text = prompt(["read", "alpha"], ["read guideline", multiline, "Be concise"]);
+	// Deferred: the whole block must vanish, including its continuation line.
+	const deferred = stabilizeToolMetadata(text, options, [readEntry, alphaEntry], true, options)!;
+	assert.doesNotMatch(deferred, /Use alpha/);
+	assert.doesNotMatch(deferred, /with context/);
+	assert.match(deferred, /Be concise/);
+	// Always: exactly one copy survives the rebuild (stale copy removed, then re-added).
+	const alwaysEntry: ToolCatalogEntry = { ...alphaEntry, policy: "always" };
+	const visible = stabilizeToolMetadata(text, options, [readEntry, alwaysEntry], true, options)!;
+	assert.equal(visible.match(/Use alpha/g)?.length, 1);
 });
 
 test("changing role and safety text is preserved rather than freezing the system prompt", () => {
@@ -293,6 +325,7 @@ test("policy records carrying NUL bytes are ignored on load", async () => {
 		);
 		const loaded = await loadToolSearchPolicies(cwd);
 		assert.equal(loaded.policies.size, 0);
+		assert.match(loaded.diagnostic ?? "", /reserved separator/);
 	} finally {
 		await rm(cwd, { recursive: true, force: true });
 	}

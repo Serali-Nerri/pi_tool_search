@@ -193,8 +193,11 @@ export class ToolCatalog {
 	}
 
 	byName(name: string): ToolCatalogEntry | undefined {
-		// Single-winner rule shared with the name maps in applyMode/tool.ts:
-		// last entry in all() order wins, so every lookup agrees on one provider.
+		// Single-winner rule shared with the full-order name map in applyMode:
+		// last entry in all() order wins. The loader (tool.ts) matches within
+		// the deferred subset instead, so a cross-policy duplicate can be
+		// advertised yet rejected by activate(); execute() reports that case
+		// explicitly instead of answering "No deferred tools were loaded."
 		const entries = this.all();
 		for (let index = entries.length - 1; index >= 0; index--) {
 			if (entries[index].tool.name === name) return entries[index];
@@ -216,7 +219,18 @@ export class ToolCatalog {
 			const entry = this.entriesByKey.get(key);
 			if (!entry || entry.protected || entry.policy === policy) continue;
 			entry.policy = policy;
+			// Keep the signature snapshot in sync: refresh() reuses a cached
+			// signature only when cached.policy matches, so a stale snapshot
+			// would force a spurious change on the next refresh.
+			const part = this.signatureParts.get(key);
+			if (part) {
+				part.policy = policy;
+				part.signature = safeEntrySignature(entry);
+			}
 			changedNames.add(entry.tool.name);
+		}
+		if (changedNames.size > 0) {
+			this.signature = [...this.signatureParts.values()].map((part) => part.signature).sort().join("\n");
 		}
 		return changedNames;
 	}

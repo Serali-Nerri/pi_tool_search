@@ -30,6 +30,8 @@ Pi 的按需工具加载扩展，支持主会话和子会话。保留稳定的�
 - 子代理只处理它的白名单内、实际已注册工具：锁定工具不会给缺少它们的会话补上，也不会加载未列入白名单的目标。
 - 除五个锁定工具外，本扩展不对任何工具名做特殊处理：是否可用只看注册、白名单与策略。工具选择不是操作系统权限沙箱。
 
+迁移说明：按角色固定的 `src/profiles/bg-wait-always.ts` 入口与 `registerToolSearch(pi, cwd, entryPath, { alwaysTools })` 参数已移除（`ToolCatalog.refresh` 的 `alwaysTools` 参数同样取消）。需要常驻某个 deferred 工具时，在全局 `~/.pi/agent/pi-tool-search.json` 或受信任项目的 `.pi/pi-tool-search.json` 里将其设为 `always`（或用 `/tool-search config` 修改）；旧配置中指向该 profile 的 `extensions` 条目请换回默认入口 `.../pi-tool-search/index.ts`。
+
 ## 工具元数据的归属与迁移
 
 模型能看到工具元数据的四条途径，以及本扩展在 `mode: "auto"` 下的控制方式：
@@ -185,7 +187,7 @@ npm install
 npm run verify
 ```
 
-- `verify`：严格 TypeScript 检查及 69 项单元/集成测试，包含真实 Pi SDK 的启动顺序、reload 和启动后注册工具的状态恢复、snippet 捕获与指南迁移的预算/回退断言、锁定集合与命名默认值、配置面板排序与保存。
+- `verify`：严格 TypeScript 检查及 78 项单元/集成测试，包含真实 Pi SDK 的启动顺序、reload 和启动后注册工具的状态恢复、snippet 捕获与指南迁移的预算/回退断言、锁定集合与命名默认值、配置面板排序与保存。
 - 开发依赖包含 `@earendil-works/pi-server@0.85.0`，用于 Pi 0.85 顶层 SDK 导出的直接 Node 导入；不会部署它或修改全局 npm 包。
 
 部署：

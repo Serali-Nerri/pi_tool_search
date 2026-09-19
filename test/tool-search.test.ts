@@ -26,7 +26,7 @@ import {
 	loadTrustedToolSearchPolicies,
 	saveToolSearchConfiguration,
 } from "../src/index.ts";
-import { buildToolGuidance, suggestToolNames, TOOL_GUIDANCE_MAX_BYTES } from "../src/tool.ts";
+import { buildToolGuidance, createToolSearchDefinition, suggestToolNames, TOOL_GUIDANCE_MAX_BYTES } from "../src/tool.ts";
 import { sortConfigEntries, toolSearchEntryLabel } from "../src/ui.ts";
 
 function tool(name: string, source: string, description = `${name} description`): ToolInfo {
@@ -242,6 +242,18 @@ test("policy saves cannot create a file that the bounded loader will reject", as
 	}
 });
 
+test("policy saves reject NUL bytes that the loader would skip", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-tool-search-nul-save-"));
+	try {
+		await assert.rejects(
+			saveToolSearchPolicies(cwd, [{ name: "a\u0000b", source: "x", policy: "always" }]),
+			/NUL/,
+		);
+	} finally {
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
 test("tool configuration labels use the actual winning source", () => {
 	const local: ToolCatalogEntry = {
 		key: "local\u0000read",
@@ -252,6 +264,22 @@ test("tool configuration labels use the actual winning source", () => {
 	assert.equal(toolSearchEntryLabel(local, local.tool.sourceInfo.path), "pi-tool-search · read 🔒");
 	const external = { ...local, key: "external\u0000read", tool: tool("read", "npm:override") };
 	assert.equal(toolSearchEntryLabel(external, "/extension/pi-tool-search/index.ts"), "npm:override · read 🔒");
+});
+
+test("ownership labels resolve relative paths against the session cwd", () => {
+	const owned: ToolCatalogEntry = {
+		key: "cli\u0000tool_search",
+		tool: {
+			...tool("tool_search", "cli"),
+			sourceInfo: { path: "./src/index.ts", source: "cli", scope: "user", origin: "package" },
+		},
+		policy: "always",
+		protected: true,
+	};
+	assert.equal(toolSearchEntryLabel(owned, "/tmp/session/src/index.ts", "/tmp/session"), "pi-tool-search · tool_search 🔒");
+	// Without the session cwd the same relative path resolves against the
+	// process cwd and must not be mistaken for this extension's loader.
+	assert.equal(toolSearchEntryLabel(owned, "/tmp/session/src/index.ts"), "cli · tool_search 🔒");
 });
 
 test("configuration labels lock base tools and the loader only", () => {
@@ -310,6 +338,26 @@ test("a failed policy save leaves the in-memory catalog unchanged", async () => 
 	} finally {
 		await rm(cwd, { recursive: true, force: true });
 	}
+});
+
+test("cross-provider duplicates report unavailable names instead of a bare miss", async () => {
+	const deferredDup: ToolCatalogEntry = {
+		key: "aaa\u0000dup",
+		tool: tool("dup", "aaa"),
+		policy: "deferred",
+		protected: false,
+	};
+	const definition = createToolSearchDefinition({
+		deferredEntries: () => [deferredDup],
+		enabled: () => true,
+		owned: () => true,
+		// The full-catalog winner is another provider's non-deferred entry, so
+		// a lifecycle-style activate filter rejects the advertised name.
+		activate: () => ({ added: [], active: [] }),
+	});
+	const result = await definition.execute("call-1", { tool_names: ["dup"] }, undefined, undefined, undefined as never);
+	assert.match(JSON.stringify(result.content), /No longer available as a deferred tool: dup/);
+	assert.deepEqual(result.details?.added, []);
 });
 
 test("unknown exact names receive bounded typo suggestions without activation", () => {
