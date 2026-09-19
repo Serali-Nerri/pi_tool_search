@@ -5,7 +5,7 @@
 ```text
 src/index.ts       Pi extension entry point
 src/lifecycle.ts   Lifecycle and active-tool management
-src/config.ts      Project policy persistence and legacy migration
+src/config.ts      Global/project policy persistence and validation
 src/manifest.ts    Bounded tool manifest generation
 src/registry.ts    Tool policies and source identities
 src/tool.ts        Exact-name deferred-tool loader and rendering

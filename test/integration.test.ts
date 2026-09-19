@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test, { after } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import extension from "../src/index.ts";
+import { registerToolSearch } from "../src/index.ts";
+import { policyRecordKey, type ToolPolicy, type ToolPolicyRecord } from "../src/registry.ts";
 
 const testRoot = mkdtempSync(`${tmpdir()}/pi-tool-search-lifecycle-`);
 process.env.PI_CODING_AGENT_DIR = testRoot;
@@ -52,6 +53,8 @@ interface RenderContextOptions {
 }
 
 interface HarnessOptions {
+	agentDir?: string;
+	loaderPath?: string;
 	externalTools?: ExternalTool[];
 	activeTools?: string[];
 	refreshActivatesAllowlist?: boolean;
@@ -104,7 +107,7 @@ function createHarness(options: HarnessOptions = {}) {
 					promptGuidelines: tool.promptGuidelines,
 					sourceInfo: {
 						source: "./src/index.ts",
-						path: resolve("src/index.ts"),
+						path: options.loaderPath ?? resolve("src/index.ts"),
 						scope: "temporary",
 						origin: "top-level",
 					},
@@ -122,7 +125,8 @@ function createHarness(options: HarnessOptions = {}) {
 			appendedEntries.push({ customType, data });
 		},
 	} as unknown as ExtensionAPI;
-	extension(pi);
+	// Always inject a disposable agent dir; config tests must never reach the real global file.
+	registerToolSearch(pi, process.cwd(), resolve("src/index.ts"), options.agentDir ?? testRoot);
 	return {
 		tools,
 		tool(name: string) {
@@ -649,6 +653,234 @@ test("resume prefers structured activation intent over inflated wrapper addition
 	await harness.emitAsync("session_start", {}, extensionContext(entries));
 	assert.equal(harness.getActiveTools().includes("web_search"), true);
 	assert.equal(harness.getActiveTools().includes("document_parse"), false);
+});
+
+async function configurationHarness(options: {
+	global?: ToolPolicyRecord[];
+	project?: ToolPolicyRecord[];
+	externalTools?: ExternalTool[];
+	trusted?: boolean;
+} = {}) {
+	const root = mkdtempSync(join(testRoot, "config-command-"));
+	const agentDir = join(root, "agent");
+	const cwd = join(root, "project");
+	mkdirSync(agentDir);
+	mkdirSync(join(cwd, ".pi"), { recursive: true });
+	const globalPath = join(agentDir, "pi-tool-search.json");
+	const projectPath = join(cwd, ".pi", "pi-tool-search.json");
+	writeFileSync(globalPath, JSON.stringify({ version: 1, tools: options.global ?? [] }));
+	writeFileSync(projectPath, JSON.stringify({ version: 1, tools: options.project ?? [] }));
+	let selected = new Map<string, ToolPolicy>();
+	const notifications: string[] = [];
+	const context = {
+		...extensionContext([], notifications),
+		cwd,
+		isProjectTrusted: () => options.trusted ?? true,
+		ui: {
+			notify: (text: string) => notifications.push(text),
+			custom: async () => new Map(selected),
+		},
+	};
+	const harness = createHarness({ agentDir, externalTools: options.externalTools ?? externalTools });
+	await harness.emitAsync("session_start", {}, context);
+	return {
+		harness, context, notifications, agentDir, cwd, globalPath, projectPath,
+		select(records: ToolPolicyRecord[]) {
+			selected = new Map(records.map((record) => [policyRecordKey(record), record.policy]));
+		},
+		globalRecords: () => JSON.parse(readFileSync(globalPath, "utf8")).tools as ToolPolicyRecord[],
+	};
+}
+
+const webPolicy = (policy: ToolPolicy): ToolPolicyRecord => ({ name: "web_search", source: "npm:pi-web-access", policy });
+const documentPolicy = (policy: ToolPolicy): ToolPolicyRecord => ({ name: "document_parse", source: "npm:pi-docparser", policy });
+
+test("closing config without edits does not write files, promote project values or reset loaded state", async () => {
+	const fixture = await configurationHarness({
+		global: [webPolicy("excluded"), { name: "absent", source: "npm:absent", policy: "excluded" }],
+		project: [webPolicy("deferred")],
+	});
+	await fixture.harness.tool("tool_search").execute!("load", { tool_names: ["web_search"] });
+	const before = readFileSync(fixture.globalPath, "utf8");
+	fixture.select([webPolicy("deferred"), documentPolicy("deferred")]);
+	await fixture.harness.command("tool-search").handler("config", fixture.context);
+	assert.equal(readFileSync(fixture.globalPath, "utf8"), before);
+	assert.equal(fixture.harness.getActiveTools().includes("web_search"), true);
+	assert.equal(fixture.harness.appendedEntries.length, 0);
+	assert.match(fixture.notifications.at(-1)!, /No tool policy changes/);
+	// A no-op does not create a missing target either.
+	rmSync(fixture.globalPath);
+	await fixture.harness.command("tool-search").handler("config", fixture.context);
+	assert.equal(existsSync(fixture.globalPath), false);
+});
+
+test("global command saves only edits while retaining absent providers and project-specific values", async () => {
+	const absent: ToolPolicyRecord = { name: "absent", source: "npm:absent", policy: "excluded" };
+	const fixture = await configurationHarness({ global: [webPolicy("excluded"), absent], project: [webPolicy("always")] });
+	const projectBefore = readFileSync(fixture.projectPath, "utf8");
+	fixture.select([webPolicy("always"), documentPolicy("always")]);
+	await fixture.harness.command("tool-search").handler("config", fixture.context);
+	assert.deepEqual(fixture.globalRecords(), [webPolicy("excluded"), absent, documentPolicy("always")]);
+	assert.equal(readFileSync(fixture.projectPath, "utf8"), projectBefore);
+	assert.equal(fixture.harness.getActiveTools().includes("web_search"), true);
+	assert.equal(fixture.harness.getActiveTools().includes("document_parse"), true);
+	assert.match(fixture.notifications.at(-1)!, /Saved 1 tool policy change/);
+});
+
+test("a stale session saving another row does not undo a newer global edit", async () => {
+	const fixture = await configurationHarness();
+	const second = createHarness({ agentDir: fixture.agentDir, externalTools });
+	await second.emitAsync("session_start", {}, fixture.context);
+	fixture.select([webPolicy("excluded"), documentPolicy("deferred")]);
+	await fixture.harness.command("tool-search").handler("config", fixture.context);
+	// The second panel still has its original effective web_search=deferred.
+	fixture.select([webPolicy("deferred"), documentPolicy("always")]);
+	await second.command("tool-search").handler("config", fixture.context);
+	assert.deepEqual(fixture.globalRecords(), [webPolicy("excluded"), documentPolicy("always")]);
+	assert.equal(second.getActiveTools().includes("web_search"), false);
+});
+
+test("masked global edits keep deferred tools loaded and persist their activation", async () => {
+	for (const policy of ["always", "excluded"] as const) {
+		const fixture = await configurationHarness({ project: [webPolicy("deferred")] });
+		await fixture.harness.tool("tool_search").execute!("load", { tool_names: ["web_search"] });
+		fixture.select([webPolicy(policy)]);
+		await fixture.harness.command("tool-search").handler("config", fixture.context);
+		assert.deepEqual(fixture.globalRecords(), [webPolicy(policy)]);
+		assert.equal(fixture.harness.getActiveTools().includes("web_search"), true);
+		assert.match(fixture.notifications.at(-1)!, /overridden by project-level/);
+		const state = fixture.harness.appendedEntries.at(-1)!;
+		assert.deepEqual((state.data as any).loaded, ["web_search"]);
+		const resumed = createHarness({ agentDir: fixture.agentDir, externalTools });
+		await resumed.emitAsync("session_start", {}, {
+			...fixture.context,
+			sessionManager: { getBranch: () => [{ type: "custom", ...state }] },
+		});
+		assert.equal(resumed.getActiveTools().includes("web_search"), true);
+	}
+});
+
+test("an effective policy change still unloads a previously deferred tool", async () => {
+	const fixture = await configurationHarness();
+	await fixture.harness.tool("tool_search").execute!("load", { tool_names: ["web_search"] });
+	fixture.select([webPolicy("excluded")]);
+	await fixture.harness.command("tool-search").handler("config", fixture.context);
+	assert.equal(fixture.harness.getActiveTools().includes("web_search"), false);
+	assert.deepEqual((fixture.harness.appendedEntries.at(-1)!.data as any).loaded, []);
+});
+
+test("project saves preserve missing-provider records without modifying the global layer", async () => {
+	const late: ToolPolicyRecord = { name: "late_tool", source: "npm:late", policy: "always" };
+	const fixture = await configurationHarness({ project: [late] });
+	const globalBefore = readFileSync(fixture.globalPath, "utf8");
+	fixture.select([webPolicy("always")]);
+	await fixture.harness.command("tool-search").handler("config project", fixture.context);
+	assert.deepEqual(JSON.parse(readFileSync(fixture.projectPath, "utf8")).tools, [late, webPolicy("always")]);
+	assert.equal(readFileSync(fixture.globalPath, "utf8"), globalBefore);
+	fixture.harness.addExternalTool({ name: "late_tool", source: "npm:late", description: "Late" });
+	await fixture.harness.emitAsync("turn_end", { toolResults: [] }, fixture.context);
+	assert.equal(fixture.harness.getActiveTools().includes("late_tool"), true);
+});
+
+test("project saves do not retain a deleted project record in the global fallback", async () => {
+	const late: ToolPolicyRecord = { name: "late_tool", source: "npm:late", policy: "excluded" };
+	const fixture = await configurationHarness({ global: [late], project: [{ ...late, policy: "always" }] });
+	// An external editor removes the project record before this save merges its edits.
+	writeFileSync(fixture.projectPath, JSON.stringify({ version: 1, tools: [] }));
+	fixture.select([webPolicy("always")]);
+	await fixture.harness.command("tool-search").handler("config project", fixture.context);
+	fixture.harness.addExternalTool({ name: "late_tool", source: "npm:late", description: "Late" });
+	await fixture.harness.emitAsync("turn_end", { toolResults: [] }, fixture.context);
+	assert.equal(fixture.harness.getActiveTools().includes("late_tool"), false);
+	assert.doesNotMatch(fixture.harness.tool("tool_search").description, /late_tool/);
+});
+
+test("failed command saves preserve the existing file, catalog and activation state", async () => {
+	const fixture = await configurationHarness();
+	const original = JSON.stringify({ version: 2, mode: "eager", tools: [webPolicy("excluded")] });
+	writeFileSync(fixture.globalPath, original);
+	fixture.select([webPolicy("always")]);
+	await fixture.harness.command("tool-search").handler("config", fixture.context);
+	assert.equal(readFileSync(fixture.globalPath, "utf8"), original);
+	assert.equal(fixture.harness.getActiveTools().includes("web_search"), false);
+	assert.match(fixture.harness.tool("tool_search").description, /web_search/);
+	assert.equal(fixture.harness.appendedEntries.length, 0);
+	assert.match(fixture.notifications.at(-1)!, /Failed to save.*Refusing to overwrite/);
+});
+
+test("project commands require trust while global commands ignore untrusted project overrides", async () => {
+	const fixture = await configurationHarness({ global: [webPolicy("excluded")], project: [webPolicy("always")], trusted: false });
+	const projectBefore = readFileSync(fixture.projectPath, "utf8");
+	fixture.select([documentPolicy("always")]);
+	await fixture.harness.command("tool-search").handler("config project", fixture.context);
+	assert.match(fixture.notifications.at(-1)!, /until this project is trusted/);
+	await fixture.harness.command("tool-search").handler("config", fixture.context);
+	assert.deepEqual(fixture.globalRecords(), [webPolicy("excluded"), documentPolicy("always")]);
+	assert.equal(fixture.harness.getActiveTools().includes("web_search"), false);
+	assert.equal(readFileSync(fixture.projectPath, "utf8"), projectBefore);
+});
+
+test("a session becoming busy while the panel is open prevents a config save", async () => {
+	const fixture = await configurationHarness();
+	const before = readFileSync(fixture.globalPath, "utf8");
+	fixture.context.ui.custom = async () => {
+		fixture.context.isIdle = () => false;
+		return new Map([[policyRecordKey(webPolicy("always")), "always" as const]]);
+	};
+	await fixture.harness.command("tool-search").handler("config", fixture.context);
+	assert.equal(readFileSync(fixture.globalPath, "utf8"), before);
+	assert.equal(fixture.harness.appendedEntries.length, 0);
+	assert.match(fixture.notifications.at(-1)!, /session must be idle/);
+});
+
+test("project trust is checked again after the panel closes", async () => {
+	const fixture = await configurationHarness();
+	const before = readFileSync(fixture.projectPath, "utf8");
+	fixture.context.ui.custom = async () => {
+		fixture.context.isProjectTrusted = () => false;
+		return new Map([[policyRecordKey(webPolicy("always")), "always" as const]]);
+	};
+	await fixture.harness.command("tool-search").handler("config project", fixture.context);
+	assert.equal(readFileSync(fixture.projectPath, "utf8"), before);
+	assert.equal(fixture.harness.appendedEntries.length, 0);
+	assert.match(fixture.notifications.at(-1)!, /project saves require trust/);
+});
+
+test("skipped policy edits do not change activation or masquerade as project overrides", async () => {
+	const name = "bad\u0000name";
+	const fixture = await configurationHarness({ externalTools: [...externalTools, { name, source: "npm:fixture", description: "Invalid name" }] });
+	const before = readFileSync(fixture.globalPath, "utf8");
+	fixture.select([{ name, source: "npm:fixture", policy: "always" }]);
+	await fixture.harness.command("tool-search").handler("config", fixture.context);
+	assert.equal(readFileSync(fixture.globalPath, "utf8"), before);
+	assert.equal(fixture.harness.getActiveTools().includes(name), false);
+	assert.match(fixture.notifications.at(-1)!, /not saved or applied/);
+	assert.ok(!fixture.notifications.some((message) => message.includes("overridden by project")));
+});
+
+test("symlinked loader metadata does not trigger a false collision", async () => {
+	const cwd = mkdtempSync(join(testRoot, "linked-loader-"));
+	const linked = join(cwd, "entry.ts");
+	symlinkSync(resolve("src/index.ts"), linked);
+	const harness = createHarness({ externalTools, loaderPath: linked });
+	const notifications: string[] = [];
+	await harness.emitAsync("session_start", {}, { ...extensionContext([], notifications), cwd });
+	assert.equal(harness.getActiveTools().includes("web_search"), false);
+	assert.equal(harness.getActiveTools().includes("tool_search"), true);
+	assert.ok(!notifications.some((text) => text.includes("owned by another extension")));
+});
+
+test("relative provider policies load and save using ctx.cwd rather than process.cwd", async () => {
+	const relativeTool = { name: "relative_tool", source: "cli", path: "./provider.ts", description: "Relative provider" };
+	const fixture = await configurationHarness({ externalTools: [...externalTools, relativeTool] });
+	const record: ToolPolicyRecord = { name: relativeTool.name, source: `file:${join(fixture.cwd, "provider.ts")}`, policy: "excluded" };
+	writeFileSync(fixture.globalPath, JSON.stringify({ version: 1, tools: [record] }));
+	await fixture.harness.emitAsync("session_start", {}, fixture.context);
+	assert.doesNotMatch(fixture.harness.tool("tool_search").description, /relative_tool/);
+	fixture.select([{ ...record, policy: "always" }]);
+	await fixture.harness.command("tool-search").handler("config", fixture.context);
+	assert.deepEqual(fixture.globalRecords(), [{ ...record, policy: "always" }]);
+	assert.equal(fixture.harness.getActiveTools().includes("relative_tool"), true);
 });
 
 test("request auditing is disabled by default and does not even access the payload", async () => {

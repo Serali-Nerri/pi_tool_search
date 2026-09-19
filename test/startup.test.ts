@@ -21,7 +21,7 @@ after(() => rmSync(testRoot, { recursive: true, force: true }));
 
 const loader = {
 	name: "startup-tool-search",
-	factory: ((pi) => registerToolSearch(pi, testRoot, "<inline:startup-tool-search>")) satisfies ExtensionFactory,
+	factory: ((pi) => registerToolSearch(pi, testRoot, "<inline:startup-tool-search>", testRoot)) satisfies ExtensionFactory,
 };
 const provider = {
 	name: "startup-provider",

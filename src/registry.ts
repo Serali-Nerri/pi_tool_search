@@ -31,14 +31,14 @@ const DEFAULT_EXCLUDED_TOOL_NAMES = new Set(["powershell"]);
 
 // One lookup per winning provider path, never a filesystem walk per request.
 const sourceIdentities = new Map<string, string>();
-export function toolSourceIdentity(tool: Pick<ToolInfo, "sourceInfo">): string {
+export function toolSourceIdentity(tool: Pick<ToolInfo, "sourceInfo">, cwd = process.cwd()): string {
 	const { source, path } = tool.sourceInfo;
 	if (source === "builtin") return source;
-	const cacheKey = `${source}\u0000${path}`;
+	const normalized = normalizeExtensionPath(path, cwd);
+	const cacheKey = `${source}\u0000${normalized}`;
 	const cached = sourceIdentities.get(cacheKey);
 	if (cached) return cached;
-	let canonical = resolve(path);
-	try { canonical = realpathSync(canonical); } catch { /* Unavailable providers retain a path identity. */ }
+	const canonical = canonicalExtensionPath(normalized, cwd);
 	const packagePath = canonical.replaceAll("\\", "/").split("/node_modules/").at(-1)!;
 	const packageName = packagePath.startsWith("@")
 		? packagePath.split("/").slice(0, 2).join("/")
@@ -52,8 +52,8 @@ export function toolSourceIdentity(tool: Pick<ToolInfo, "sourceInfo">): string {
 	return identity;
 }
 
-export function toolKey(tool: Pick<ToolInfo, "name" | "sourceInfo">): string {
-	return `${toolSourceIdentity(tool)}\u0000${tool.name}`;
+export function toolKey(tool: Pick<ToolInfo, "name" | "sourceInfo">, cwd = process.cwd()): string {
+	return `${toolSourceIdentity(tool, cwd)}\u0000${tool.name}`;
 }
 
 /**
@@ -66,7 +66,7 @@ export function normalizeExtensionPath(rawPath: string, cwd = process.cwd()): st
 	if (candidate.startsWith("file://")) {
 		try {
 			return resolve(fileURLToPath(candidate));
-	} catch { /* Fall through to plain normalization. */ }
+		} catch { /* Fall through to plain normalization. */ }
 	}
 	const expanded = candidate === "~" || candidate.startsWith("~/") || candidate.startsWith("~\\")
 		? homedir() + candidate.slice(1)
@@ -75,14 +75,32 @@ export function normalizeExtensionPath(rawPath: string, cwd = process.cwd()): st
 	return isAbsolute(expanded) ? resolve(expanded) : resolve(cwd, expanded);
 }
 
+// Existing provider paths are stable for this extension instance. Share the
+// realpath lookup between identity and ownership checks, not once per turn.
+const canonicalPaths = new Map<string, string>();
+function canonicalExtensionPath(rawPath: string, cwd: string): string {
+	const normalized = normalizeExtensionPath(rawPath, cwd);
+	if (normalized.startsWith("<") && normalized.endsWith(">")) return normalized;
+	const cached = canonicalPaths.get(normalized);
+	if (cached) return cached;
+	try {
+		const canonical = realpathSync(normalized);
+		canonicalPaths.set(normalized, canonical);
+		return canonical;
+	} catch {
+		// Do not cache failures: a dynamically registered provider may appear later.
+		return normalized;
+	}
+}
+
 /** Single shared ownership check: UI labels and loader collision use this. */
 export function isOwnedBy(
 	tool: Pick<ToolInfo, "sourceInfo">,
 	extensionPath: string,
 	cwd = process.cwd(),
 ): boolean {
-	return normalizeExtensionPath(tool.sourceInfo.path, cwd)
-		=== normalizeExtensionPath(extensionPath, cwd);
+	return canonicalExtensionPath(tool.sourceInfo.path, cwd)
+		=== canonicalExtensionPath(extensionPath, cwd);
 }
 
 /** Deterministic code-point ordering: identical on every machine and locale. */
@@ -146,7 +164,7 @@ interface SignatureSnapshot {
 	signature: string;
 }
 
-type CatalogEntry = ToolCatalogEntry & { snapshot: SignatureSnapshot };
+type CatalogEntry = ToolCatalogEntry & { snapshot: SignatureSnapshot; fallbackPolicy: ToolPolicy };
 
 function compareEntries(left: CatalogEntry, right: CatalogEntry): number {
 	return Number(right.protected) - Number(left.protected)
@@ -160,6 +178,8 @@ export class ToolCatalog {
 	private entriesByName = new Map<string, CatalogEntry>();
 	private signature = "";
 
+	constructor(private readonly cwd = process.cwd()) {}
+
 	refresh(
 		tools: readonly ToolInfo[],
 		initiallyActive: ReadonlySet<string>,
@@ -169,13 +189,14 @@ export class ToolCatalog {
 		const previous = this.signature;
 		const next = new Map<string, CatalogEntry>();
 		for (const tool of tools) {
-			const key = toolKey(tool);
+			const key = toolKey(tool, this.cwd);
 			const protectedTool = PROTECTED_TOOL_NAMES.has(tool.name);
 			const existing = this.entriesByKey.get(key);
+			// Preserve the original default, not a former file override. Removing
+			// a record must not leave its effective value stuck in the catalog.
+			const fallbackPolicy = existing?.fallbackPolicy ?? defaultPolicy(tool, initiallyActive);
 			const configured = projectPolicies.get(key) ?? savedPolicies.get(key);
-			const policy = protectedTool
-				? "always"
-				: configured ?? existing?.policy ?? defaultPolicy(tool, initiallyActive);
+			const policy = protectedTool ? "always" : configured ?? fallbackPolicy;
 			// Reuse the cached signature when nothing it covers changed: the
 			// snapshot holds the previous field references, so any reassigned
 			// description/schema/guidelines object (or a policy change) misses
@@ -198,6 +219,7 @@ export class ToolCatalog {
 				tool,
 				policy,
 				protected: protectedTool,
+				fallbackPolicy,
 				snapshot: {
 					description: tool.description,
 					parameters: tool.parameters,
@@ -241,6 +263,8 @@ export class ToolCatalog {
 			const entry = this.entriesByKey.get(key);
 			if (!entry || entry.protected || entry.policy === policy) continue;
 			entry.policy = policy;
+			// Explicit in-memory overrides survive refresh without becoming file-layer state.
+			entry.fallbackPolicy = policy;
 			// Keep the signature snapshot in sync: refresh() reuses a cached
 			// signature only when cached.policy matches, so a stale snapshot
 			// would force a spurious change on the next refresh.
@@ -254,13 +278,14 @@ export class ToolCatalog {
 		return changedNames;
 	}
 
-	policyRecords(overrides?: ReadonlyMap<string, ToolPolicy>): ToolPolicyRecord[] {
+	/** Serialize only the explicitly edited, registered, non-locked policies. */
+	policyRecords(edits: ReadonlyMap<string, ToolPolicy>): ToolPolicyRecord[] {
 		return this.all()
-			.filter((entry) => !entry.protected)
+			.filter((entry) => !entry.protected && edits.has(entry.key))
 			.map((entry) => ({
 				name: entry.tool.name,
-				source: toolSourceIdentity(entry.tool),
-				policy: overrides?.get(entry.key) ?? entry.policy,
+				source: toolSourceIdentity(entry.tool, this.cwd),
+				policy: edits.get(entry.key)!,
 			}));
 	}
 }

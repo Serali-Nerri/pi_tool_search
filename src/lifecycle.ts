@@ -1,11 +1,12 @@
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
 import {
 	loadEffectiveToolSearchPolicies,
 	loadToolSearchPolicies,
 	saveGlobalToolSearchPolicies,
 	saveToolSearchPolicies,
 	type LoadedToolSearchPolicies,
+	type SavedToolSearchPolicies,
 } from "./config.ts";
 import {
 	isOwnedBy,
@@ -13,7 +14,6 @@ import {
 	ToolCatalog,
 	TOOL_SEARCH_NAME,
 	type ToolPolicy,
-	type ToolPolicyRecord,
 } from "./registry.ts";
 import { createToolSearchDefinition } from "./tool.ts";
 import { showToolSearchConfig } from "./ui.ts";
@@ -77,19 +77,19 @@ export async function loadTrustedToolSearchPolicies(
 export async function saveToolSearchConfiguration(
 	cwd: string,
 	catalog: ToolCatalog,
-	selected: ReadonlyMap<string, ToolPolicy>,
-	scope: "global" | "project" = "global",
-): Promise<{ path: string; records: ToolPolicyRecord[]; changedNames: Set<string>; skipped: number }> {
-	const candidates = catalog.policyRecords(selected);
-	const saved = scope === "global"
-		? await saveGlobalToolSearchPolicies(candidates)
-		: await saveToolSearchPolicies(cwd, candidates);
-	return { ...saved, changedNames: catalog.applyPolicies(selected) };
+	edits: ReadonlyMap<string, ToolPolicy>,
+	scope: "global" | "project",
+	agentDir = getAgentDir(),
+): Promise<SavedToolSearchPolicies> {
+	const candidates = catalog.policyRecords(edits);
+	return scope === "global"
+		? saveGlobalToolSearchPolicies(candidates, agentDir)
+		: saveToolSearchPolicies(cwd, candidates);
 }
 
-export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath: string): void {
-	let catalog = new ToolCatalog();
-	let savedPolicies = new Map<string, ToolPolicy>();
+export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath: string, agentDir = getAgentDir()): void {
+	let catalog = new ToolCatalog(cwd);
+	let globalPolicies = new Map<string, ToolPolicy>();
 	let projectPolicies = new Map<string, ToolPolicy>();
 	let enabled = true;
 	let collision = false;
@@ -208,7 +208,7 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 	};
 
 	const refreshCatalog = (): boolean =>
-		catalog.refresh(pi.getAllTools(), new Set(pi.getActiveTools()), savedPolicies, projectPolicies);
+		catalog.refresh(pi.getAllTools(), new Set(pi.getActiveTools()), globalPolicies, projectPolicies);
 
 	const restoreForContext = (context: ExtensionContext): void => {
 		const sessionManager = context.sessionManager as typeof context.sessionManager & {
@@ -248,15 +248,15 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 	pi.on("session_start", async (_event, context) => {
 		cwd = context.cwd || cwd;
 		captureSnippetsFromPrompt(context.getSystemPrompt());
-		catalog = new ToolCatalog();
+		catalog = new ToolCatalog(cwd);
 		hiddenByThisExtension.clear();
 		lastDescription = undefined;
 		warnedTemplate = false;
 		audit.reset();
 		native = supportsIncrementalTools(context.model);
 		standardPrompt = true;
-		const config = await loadEffectiveToolSearchPolicies(cwd, context.isProjectTrusted());
-		savedPolicies = config.policies;
+		const config = await loadEffectiveToolSearchPolicies(cwd, context.isProjectTrusted(), agentDir);
+		globalPolicies = config.globalPolicies ?? new Map();
 		projectPolicies = config.projectPolicies ?? new Map();
 		mode = config.mode ?? "auto";
 		auditEnabled = config.audit === true || process.env.PI_TOOL_SEARCH_AUDIT === "1";
@@ -396,37 +396,48 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 				const before = new Map(catalog.all().map((entry) => [entry.key, entry.policy]));
 				const selected = await showToolSearchConfig(context, catalog.all(), extensionPath, cwd);
 				if (!selected) return;
-				let saved: Awaited<ReturnType<typeof saveToolSearchConfiguration>>;
+				const edits = new Map([...selected].filter(([key, policy]) => {
+					const entry = catalog.byKey(key);
+					return entry && !entry.protected && before.get(key) !== policy;
+				}));
+				if (edits.size === 0) {
+					context.ui.notify("No tool policy changes to save.", "info");
+					return;
+				}
+				if (!context.isIdle() || (scope === "project" && !context.isProjectTrusted())) {
+					context.ui.notify("Tool-search policy was not saved: the session must be idle and project saves require trust.", "warning");
+					return;
+				}
+				let saved: SavedToolSearchPolicies;
 				try {
-					saved = await saveToolSearchConfiguration(cwd, catalog, selected, scope);
+					saved = await saveToolSearchConfiguration(cwd, catalog, edits, scope, agentDir);
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
 					context.ui.notify(`Failed to save tool-search policy: ${message}`, "error");
 					return;
 				}
-				const { path, records, changedNames, skipped } = saved;
-				for (const name of changedNames) loaded.delete(name);
+				const { path, records, skipped } = saved;
 				const savedLayer = new Map(records.map((record) => [policyRecordKey(record), record.policy]));
-				if (scope === "global") savedPolicies = savedLayer;
+				if (scope === "global") globalPolicies = savedLayer;
 				else projectPolicies = savedLayer;
-				// Re-derive effective policies from the updated layers: a project
-				// record still wins over a just-saved global one.
+				// Keep the layers separate. applyMode prunes loaded only after the
+				// effective policy changes; a masked global edit must not unload it.
 				refreshCatalog();
 				registerLoader();
 				applyMode();
 				pi.appendEntry(TOOL_SEARCH_STATE_ENTRY, { enabled, loaded: [...loaded.keys()], loadedKeys: [...loaded.values()] });
-				const changed = [...selected].filter(([key, policy]) => before.get(key) !== policy).length;
+				const changed = edits.size - skipped;
 				context.ui.notify(`Saved ${changed} tool policy change${changed === 1 ? "" : "s"} to ${path}.`, "info");
 				if (skipped > 0) {
 					context.ui.notify(
-						`${skipped} tool policy record(s) not saved: reserved separator in name/source. They apply in memory only for this session.`,
+						`${skipped} tool policy record(s) not saved or applied: reserved separator in name/source.`,
 						"warning",
 					);
 				}
 				if (scope === "global") {
-					const overridden = [...selected].filter(([key, policy]) => {
+					const overridden = [...edits].filter(([key, policy]) => {
 						const entry = catalog.byKey(key);
-						return entry && !entry.protected && entry.policy !== policy;
+						return entry && !entry.protected && savedLayer.get(key) === policy && entry.policy !== policy;
 					}).length;
 					if (overridden > 0) {
 						context.ui.notify(

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -142,6 +142,8 @@ test("global defaults and trusted project overrides retain precedence", async ()
 		const trusted = await loadEffectiveToolSearchPolicies(cwd, true, agentDir);
 		assert.equal(trusted.mode, "auto");
 		assert.equal(trusted.audit, false);
+		assert.equal(trusted.globalPolicies?.get("npm:fixture\u0000alpha"), "always");
+		assert.equal(trusted.projectPolicies?.get("npm:fixture\u0000alpha"), "deferred");
 		const catalog = new ToolCatalog();
 		const value = tool("alpha", "cli", "/tmp/node_modules/fixture/index.ts");
 		catalog.refresh([value], new Set(), trusted.policies, trusted.projectPolicies);
@@ -190,6 +192,32 @@ test("multiline guidelines are removed as whole blocks, never leaked or duplicat
 	const alwaysEntry: ToolCatalogEntry = { ...alphaEntry, policy: "always" };
 	const visible = stabilizeToolMetadata(text, options, [readEntry, alwaysEntry], true, options)!;
 	assert.equal(visible.match(/Use alpha/g)?.length, 1);
+});
+
+test("overlapping and adjacent multiline guidelines are removed longest-first with literal matching", () => {
+	const short = "Use alpha (a+b)? [x].";
+	const long = `${short}\n  with context`;
+	const alpha = tool("alpha");
+	alpha.promptGuidelines = [short, long];
+	const inherited = prompt(["alpha"], [long, long, short, "Keep role safety instructions"]);
+	const options = { cwd: "/tmp", customPrompt: inherited, promptGuidelines: [short] };
+	for (const policy of ["deferred", "always"] as const) {
+		const entries: ToolCatalogEntry[] = [{ key: toolKey(alpha), tool: alpha, policy, protected: false }];
+		const output = stabilizeToolMetadata(inherited, options, entries, true)!;
+		assert.equal(output.split("with context").length - 1, policy === "always" ? 1 : 0);
+		assert.match(output, /Keep role safety instructions/);
+		assert.equal(output, stabilizeToolMetadata(output, options, entries, true));
+	}
+});
+
+test("a known single-line guideline cannot consume an unknown continuation", () => {
+	const alpha = tool("alpha");
+	alpha.promptGuidelines = ["Use alpha"];
+	const entries: ToolCatalogEntry[] = [{ key: toolKey(alpha), tool: alpha, policy: "excluded", protected: false }];
+	const inherited = prompt([], ["Use alpha\n  unknown safety caveat", "Other safety instructions"]);
+	const output = stabilizeToolMetadata(inherited, { cwd: "/tmp" }, entries, true)!;
+	assert.match(output, /- Use alpha\n  unknown safety caveat/);
+	assert.match(output, /Other safety instructions/);
 });
 
 test("changing role and safety text is preserved rather than freezing the system prompt", () => {
@@ -321,6 +349,52 @@ test("ownership comparison normalizes file URLs, home paths and relatives", asyn
 	} finally {
 		await rm(cwd, { recursive: true, force: true });
 	}
+});
+
+test("symlinked provider paths share ownership and policy identity with their real paths", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-tool-search-symlink-owner-"));
+	try {
+		const provider = join(cwd, "provider");
+		await mkdir(provider);
+		await writeFile(join(provider, "index.ts"), "");
+		await symlink(provider, join(cwd, "linked"), "dir");
+		const linked = tool("tool_search", "cli", "./linked/index.ts");
+		const real = tool("tool_search", "cli", join(provider, "index.ts"));
+		assert.equal(isOwnedBy(linked, real.sourceInfo.path, cwd), true);
+		assert.equal(toolKey(linked, cwd), toolKey(real));
+	} finally {
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("relative provider identity, catalog lookup and saved records use the session cwd", async () => {
+	const cwd = await mkdtemp(join(tmpdir(), "pi-tool-search-relative-identity-"));
+	try {
+		const relative = tool("alpha", "cli", "./provider.ts");
+		const absolute = tool("alpha", "cli", join(cwd, "provider.ts"));
+		const key = toolKey(absolute);
+		assert.equal(toolKey(relative, cwd), key);
+		assert.equal(toolKey(tool("alpha", "cli", pathToFileURL(absolute.sourceInfo.path).href), cwd), key);
+		assert.notEqual(toolKey(relative, join(cwd, "other")), key);
+		const catalog = new ToolCatalog(cwd);
+		catalog.refresh([relative], new Set(), new Map([[key, "always"]]));
+		assert.equal(catalog.byName("alpha")?.key, key);
+		assert.equal(catalog.byKey(key)?.policy, "always");
+		assert.deepEqual(catalog.policyRecords(new Map([[key, "excluded"]])), [{
+			name: "alpha", source: `file:${absolute.sourceInfo.path}`, policy: "excluded",
+		}]);
+	} finally {
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("removing a file policy restores the original default rather than the old effective value", () => {
+	const value = tool("alpha");
+	const catalog = new ToolCatalog();
+	catalog.refresh([value], new Set(), new Map([[toolKey(value), "always"]]));
+	assert.equal(catalog.byName("alpha")?.policy, "always");
+	catalog.refresh([value], new Set(["alpha"]), new Map());
+	assert.equal(catalog.byName("alpha")?.policy, "excluded");
 });
 
 test("policy records carrying NUL bytes are ignored on load", async () => {

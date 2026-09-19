@@ -79,10 +79,15 @@ export function stabilizeToolMetadata(
 		...entries.flatMap((entry) => entry.tool.promptGuidelines ?? []),
 	]) {
 		const trimmed = guide.trim();
-		if (trimmed) removable.add(`\n- ${trimmed}\n`);
+		if (trimmed) removable.add(`- ${trimmed}\n`);
 	}
-	for (const block of removable) {
-		remainder = remainder.replaceAll(block, "\n");
+	// Longest first: a known single-line guide may prefix a multiline one.
+	// Require the end of a bullet too, so unknown continuation text is kept.
+	// The leading newline is lookbehind rather than consumed, which also
+	// removes adjacent duplicate blocks without skipping every other one.
+	for (const block of [...removable].sort((left, right) => right.length - left.length)) {
+		const escaped = block.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		remainder = remainder.replace(new RegExp(`(?<=\\n)${escaped}(?=\\n*(?:- |$))`, "g"), "");
 	}
 	remainder = remainder.slice(1);
 	const guides = new Set<string>();
