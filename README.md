@@ -27,6 +27,17 @@ Pi 的按需工具加载扩展，支持主会话与子会话。保留稳定、�
 - 子会话只处理其白名单内实际注册的工具，锁定策略不会凭空补齐缺少的工具。
 - 工具选择不是操作系统权限沙箱，不对其他工具名作特殊处理。
 
+### 与其他工具集管理扩展共存
+
+tool-search 通过调整 Pi 的 active 工具集合实现按需加载：工具保持注册，未加载时不激活，加载后重新激活。
+
+如果其他扩展也通过 `setActiveTools()` 或 `systemPromptOptions.selectedTools` 修改工具集合，例如计划模式、工具开关或另一个按需加载器，双方的修改可能相互覆盖。**这属于运行时行为冲突，不一定产生启动错误或冲突提示。**
+
+- **不自动协调工具集合控制权。** 其他扩展临时隐藏的工具，可能被 tool-search 按自身策略重新激活；反过来，其他扩展也可能隐藏已加载工具或提前激活 deferred 工具。
+- **尊重 Pi 注册表级限制。** 原生 `--tools` / `--exclude-tools`，以及 SDK 的 `tools` / `excludeTools` 所排除的工具，不能由 tool-search 重新激活。仅从 active 列表移除工具不等同于这种限制。
+
+上述限制针对工具集合管理，不代表普通工具扩展无法共存。工具自身的执行逻辑和执行前检查不会被 tool-search 替换或绕过。
+
 ## Pi 0.86：结构化提示词与工具历史
 
 本扩展不再解析 `Available tools:` / `Guidelines:` 标记，也不返回整段 `{ systemPrompt }`。
@@ -74,9 +85,20 @@ Pi 将初始提示词和工具定义记录在 transcript 的首个 system 消息
 
 子代理的 `extensions` 必须包含 `pi-tool-search` 和工具提供者；`tools` 白名单必须包含 `tool_search` **以及待加载工具名**。仅列出 loader 不会使白名单外工具可用。未启用这些扩展的 worker/reviewer 等代理不受影响。
 
-**pi-subagents-lite 1.14.0 的限制：** `exclude_tools` 只是启动后的一次 active 列表过滤，并未传成 Pi 的注册表级排除；后续 active 集合刷新可能将它们重新启用。本扩展不读取或猜测其他扩展的 agent 配置，因此不要依赖该黑名单与 tool-search 组合实现限制；改用 `tools` 白名单。本扩展自身的 `excluded` 策略仍生效（五个锁定工具除外）。
-
 后于本扩展运行的其他事件处理器仍可修改提示词、强制替换提示词或改写请求；这些修改不属于本扩展的稳定性保证。
+
+### pi-subagents-lite 的工具限制说明
+
+以下针对 Pi 0.86.1 与 pi-subagents-lite 1.14.0：
+
+- **`tools` 白名单**：明确列出允许使用的工具。白名单外工具不会进入子会话注册表，tool-search 无法加载它们。
+- **`exclude_tools` 黑名单**：用于从默认工具集合中排除少数工具，避免维护完整白名单。它与白名单是两种配置方式，并非必须同时使用。
+
+当前 pi-subagents-lite 的 `exclude_tools` 仅在初始化后过滤一次 **active 工具集合**，没有将排除名单传给 Pi SDK 的 `excludeTools`。工具仍然注册，因此后续工具加载或 active 集合刷新可能重新激活它们。
+
+这是 **pi-subagents-lite 的黑名单实现限制**，不是 tool-search 特有的问题。本扩展尊重 Pi 的注册表级限制，但不读取或补充其他扩展的黑名单约束。
+
+**建议使用显式 `tools` 白名单；这种配置不受上述问题影响。** 如果需要可靠的黑名单语义，应在 pi-subagents-lite 创建子会话时，将解析后的排除名单传入 SDK `excludeTools`，而非仅修改一次 active 列表。
 
 ### 压缩后的指南恢复
 
