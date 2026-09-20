@@ -629,12 +629,30 @@ test("portable mode off and on restore allowed tools and reset loaded state", as
 	assert.equal(harness.getActiveTools().includes("tool_search"), true);
 });
 
-test("unrecognized prompt falls back without modifying the supplied role", async () => {
+test("custom prefix status and tool metadata follow the current prompt without modifying its role", async () => {
 	const harness = await startHarness({ externalTools });
-	const results = await harness.emitAsync("before_agent_start", { systemPromptOptions: { cwd: testRoot, customPrompt: "Custom safety instructions" } }, extensionContext());
-	assert.deepEqual(results, [undefined]);
-	assert.equal(harness.getActiveTools().includes("tool_search"), false);
-	assert.equal(harness.getActiveTools().includes("web_search"), true);
+	const notifications: string[] = [];
+	const context = extensionContext([], notifications);
+	const cases = [
+		{ prefix: "Custom safety instructions", deferred: true },
+		{ prefix: undefined, deferred: true },
+		{ prefix: "Role\n<tools>Parent tool metadata</tools>", deferred: true },
+		{ prefix: "Role", deferred: false, sections: { tools: "Authored tool section" } },
+		{ prefix: "Role", deferred: false, forceSystemPrompt: "" },
+		{ prefix: "Another custom role", deferred: true },
+	];
+	for (const { prefix, deferred, sections, forceSystemPrompt } of cases) {
+		const options = { cwd: testRoot, customPrompt: prefix, sections, forceSystemPrompt };
+		const results = await harness.emitAsync("before_agent_start", { systemPromptOptions: options }, context);
+		assert.deepEqual(results, [undefined]);
+		assert.equal(options.customPrompt, prefix);
+		assert.equal(harness.getActiveTools().includes("tool_search"), deferred);
+		assert.equal(harness.getActiveTools().includes("web_search"), !deferred);
+		await harness.command("tool-search").handler("status", context);
+		const status = notifications.at(-1)!;
+		assert.equal(status.includes("custom prefix"), deferred && !!prefix);
+		assert.match(status, deferred ? /Tool search on/ : /eager.*forced prompt or authored tools\/rules section/);
+	}
 });
 
 test("child policy is loaded from ctx.cwd rather than the factory process cwd", async () => {

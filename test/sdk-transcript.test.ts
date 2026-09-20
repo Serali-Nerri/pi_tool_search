@@ -27,13 +27,13 @@ async function payload(model: Model<Api>, context: TranscriptContext): Promise<J
 	return JSON.parse(JSON.stringify(captured)) as JsonObject;
 }
 
-for (const [api, native] of [
+for (const customPrompt of [undefined, "Read-only fixture role. Never delete files."]) for (const [api, native] of [
 	["openai-responses", true], ["openai-codex-responses", true], ["anthropic-messages", true],
 	["openai-completions", true], ["openai-completions", false],
 ] as const) {
-	test(`SDK first request, activation, repeat and actual serialization: ${api} ${native ? "native" : "portable"}`, async () => {
+	test(`SDK first request, activation, repeat and actual serialization: ${api} ${native ? "native" : "portable"} ${customPrompt ? "custom prefix" : "default prompt"}`, async () => {
 		const model = fixtureModel(api, native);
-		const f = await sdkFixture({ model });
+		const f = await sdkFixture({ model, customPrompt });
 		try {
 			f.responses.push([toolCall("tool_search", { tool_names: ["alpha"] })], [toolCall("alpha")], [toolCall("tool_search", { tool_names: ["alpha"] })]);
 			await f.session.prompt("load and use alpha, then repeat");
@@ -49,6 +49,7 @@ for (const [api, native] of [
 			assert.doesNotMatch(prompt, /alpha structured snippet|Use alpha carefully/);
 			for (const request of f.requests) assert.equal(getCurrentSystemPrompt(request.messages), prompt);
 			assert.equal(systemMessages(first).length, 1);
+			if (customPrompt) assert.equal(systemMessages(first)[0].sections?.preamble, customPrompt);
 			assert.equal(systemMessages(loaded).length, 2);
 			assert.deepEqual(systemMessages(loaded)[1].toolsAdded?.map((tool) => tool.name), ["alpha"]);
 			assert.equal(systemMessages(loaded)[1].sections, undefined);
@@ -188,13 +189,16 @@ test("SDK mid-run compaction restores guidance immediately even with already-pol
 	} finally { await fixture.cleanup(); }
 });
 
-test("SDK opaque parent/custom prompt is preserved and conservatively uses eager tools", async () => {
-	const f = await sdkFixture({ customPrompt: "Parent role\n<tools>Parent-owned metadata</tools>\nNever delete files." });
+test("SDK tags in a parent/custom prompt are preserved as text and do not take ownership of sections", async () => {
+	const customPrompt = "Parent role\n<tools>Parent-owned metadata</tools>\nNever delete files.";
+	const f = await sdkFixture({ customPrompt });
 	try {
 		await f.session.prompt("inspect only");
-		assert.ok(!names(f.requests[0]).includes("tool_search"));
-		assert.ok(names(f.requests[0]).includes("alpha"));
-		assert.match(getCurrentSystemPrompt(f.requests[0].messages), /Parent-owned metadata.*Never delete files/s);
+		assert.ok(names(f.requests[0]).includes("tool_search"));
+		assert.ok(!names(f.requests[0]).includes("alpha"));
+		assert.equal(systemMessages(f.requests[0])[0].sections?.preamble, customPrompt);
+		assert.match(systemMessages(f.requests[0])[0].sections?.tools ?? "", /tool_search/);
+		assert.deepEqual(f.errors, []);
 	} finally { await f.cleanup(); }
 });
 

@@ -1,9 +1,12 @@
 import type { BuildSystemPromptOptions } from "@earendil-works/pi-coding-agent";
 import { TOOL_SEARCH_NAME, type ToolCatalogEntry } from "./registry.ts";
 
-/** Opaque/custom tool sections belong to their author, not to this extension. */
+/**
+ * Ownership comes from structured fields, never from text in an author's prompt.
+ * Forced prompts and explicitly authored tool sections conservatively use eager.
+ */
 export function hasStructuredToolMetadata(options: BuildSystemPromptOptions): boolean {
-	return !options.customPrompt && options.forceSystemPrompt === undefined
+	return options.forceSystemPrompt === undefined
 		&& !Object.hasOwn(options.sections ?? {}, "tools")
 		&& !Object.hasOwn(options.sections ?? {}, "rules");
 }

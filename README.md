@@ -48,9 +48,33 @@ Pi 将初始提示词和工具定义记录在 transcript 的首个 system 消息
 
 ### 自定义提示词与子会话
 
-如果本扩展运行时已经存在 `customPrompt`、`forceSystemPrompt`，或其他扩展显式提供了 `sections.tools` / `sections.rules`，则保守回退 **eager**：原始内容不被解析或改写，仍遵守排除策略与白名单。
+**`mode: "auto"` 自动支持自定义提示词，无需额外兼容开关。** Pi 0.86 将 `customPrompt` 原文作为 `preamble`，工具元数据仍独立可用。本扩展按**结构化字段的归属**处理，不根据任意文本中的标签或标题猜测工具说明。
 
-**迁移注意：** 将父会话整段渲染后的提示词复制为子会话 `customPrompt`，也属于此回退范围，即使里面有旧标记或 XML 标签。要让子会话继续按需加载，应使用 Pi 默认结构化提示词，通过 append 或非 tools/rules 的命名 section 传递额外角色和任务要求，不复制父会话的工具说明。
+| 部分 | tool-search 的职责 |
+|---|---|
+| `customPrompt`、`appendSystemPrompt` | 原样保留，不扫描、解析、清理或改写其中的文字 |
+| `contextFiles`、`skills`、`cwd`、其他命名 sections | 不接管，允许调用方正常更新 |
+| `toolSnippets`、`toolGuidelines` | 按工具策略生成展示内容；常驻工具正常展示，deferred 指南随首次加载结果交付 |
+| 通用 `promptGuidelines` | 保留；即使文字与 deferred/excluded 工具指南相同，也不按工具策略删除 |
+| `selectedTools`、active 集合 | 按策略管理，遵守 Pi 注册表级白名单 |
+| 显式 `sections.tools` / `sections.rules` | 保留作者段落，不覆盖；保守回退 eager |
+| `forceSystemPrompt` | 尊重完整替换（包括空字符串），默认回退 eager，不偷偷追加或改写最终提示词 |
+
+显式段落冲突按属性是否存在判断，即使值为空也不接管。工具提供者注册 `promptSnippet` / `promptGuidelines`，或像 pi-fff 一样覆盖 find/grep 实现，**不属于段落冲突**。本扩展每次在写入自己的 tools/rules sections **之前**检查；Pi 下一次 `before_agent_start` 会从基础选项重新构建输入，因此不会把本扩展上一轮生成的内容当作其他作者的覆盖。
+
+`customPrompt` 或 append 文本里写了 `<tools>`、`<rules>`、`Available tools:`、`Guidelines:` 等内容，仍只是作者文本，**不会触发 eager**。这些文字即使包含旧工具说明或被排除工具的名字，也不会被擦除或获得执行权限；本扩展只保证自己的工具目录、元数据与实际工具集合遵循策略，不保证自由文本与当前工具集一致。
+
+首条模型请求后，按需管理自定义前缀时 `/tool-search status` 会标明 `custom prefix`。`mode: "eager"` 和 `/tool-search off` 继续固定展示允许工具，不被自定义前缀改变。强制提示和显式段落覆盖的回退也只启用策略允许、已注册的工具，白名单与 excluded 仍生效。
+
+**行为变化：** 旧版对所有 `customPrompt` 都回退 eager；现在仅因其存在或文本内容不会回退。需要固定工具集时，使用已有的 `mode: "eager"`。角色、append、项目上下文、自定义规则及其他命名 sections 不被冻结。
+
+#### 子代理集成验证
+
+这是通用提示词行为，不依赖 pi-subagents-lite。已通过 `pi-subagents-lite 1.14.0` 的 **replace + 显式 `tools` 白名单** 路径验证，无需修改该扩展或增加 tool-search 设置。也覆盖 `inherit` 路径：父提示文本原样保留，不因其中的工具标签回退；复制来的父工具说明不被清理或同步，仍由调用方负责其一致性。
+
+子代理的 `extensions` 必须包含 `pi-tool-search` 和工具提供者；`tools` 白名单必须包含 `tool_search` **以及待加载工具名**。仅列出 loader 不会使白名单外工具可用。未启用这些扩展的 worker/reviewer 等代理不受影响。
+
+**pi-subagents-lite 1.14.0 的限制：** `exclude_tools` 只是启动后的一次 active 列表过滤，并未传成 Pi 的注册表级排除；后续 active 集合刷新可能将它们重新启用。本扩展不读取或猜测其他扩展的 agent 配置，因此不要依赖该黑名单与 tool-search 组合实现限制；改用 `tools` 白名单。本扩展自身的 `excluded` 策略仍生效（五个锁定工具除外）。
 
 后于本扩展运行的其他事件处理器仍可修改提示词、强制替换提示词或改写请求；这些修改不属于本扩展的稳定性保证。
 
@@ -162,9 +186,27 @@ npm run verify
 - 真实 Pi SDK 的首条 `session.prompt()`、加载后立即使用、重复加载、启动/运行中注册、显式子会话白名单。
 - reload、resume、tree 分支恢复、模型切换、手动/运行中 compaction、已排队 steering 下的即时指南恢复。
 - inline 工厂身份隔离及旧记录保守迁移；同批注册与首次加载时的指南交付；目录变更后的新 snippet 与结构化指南覆盖（包括显式空数组）。
-- 真实 pi-ai provider 序列化：Responses、Codex、Anthropic、原生/普通 Chat Completions，及移除/重定义回退和审计兼容。
+- 真实 pi-ai provider 序列化：默认提示与 custom prefix 下的 Responses、Codex、Anthropic、原生/普通 Chat Completions，及移除/重定义回退和审计兼容。
+- 固定开发依赖 `pi-subagents-lite@1.14.0` 的真实 `runAgent` 路径：临时 frontmatter、扩展加载/过滤、SDK 白名单、首轮隐藏、加载后立即调用、重复加载与父子隔离；无配置时的默认 auto、显式 eager、继承文本保持及缺少 loader 的回退。
+- 通用 custom prefix 的默认 auto、状态提示、任意前缀/append 原文保持、角色/上下文更新、工具实现覆盖与通用规则保留、精确强制提示/显式工具 sections 回退、reload/resume/tree/compaction。
 
-SDK 测试使用临时 agent 目录与模拟模型响应；序列化测试在 `onPayload` 截获后终止，**不发送 HTTP、不调用真实模型、不验证服务端缓存命中**。这不是回环 HTTP 或远端端到端测试。开发依赖不随部署复制。
+SDK 和 subagents 测试使用临时 agent 目录、假凭据、fixture 工具与模拟模型响应；序列化测试在 `onPayload` 截获后终止，**不发送 HTTP、不调用真实模型、不验证服务端缓存命中**。这不是回环 HTTP 或远端端到端测试，也不验证真实 web 服务。开发依赖不随部署复制。
+
+单独运行 subagents 集成测试：
+
+```bash
+node --import tsx --test test/subagents-lite.test.ts
+```
+
+也可指定已安装包目录和 SDK 的 `dist/index.js` 绝对路径，仍只在临时目录中运行，不改已安装文件或用户配置：
+
+```bash
+PI_TOOL_SEARCH_TEST_SUBAGENTS_DIR="$HOME/.pi/agent/npm/node_modules/pi-subagents-lite" \
+PI_TOOL_SEARCH_TEST_SDK_ENTRY="$(npm root -g)/@earendil-works/pi-coding-agent/dist/index.js" \
+node --import tsx --test test/subagents-lite.test.ts
+```
+
+该集成用例针对 1.14.0，其他版本显式报错，不静默跳过。
 
 部署前先确保目标 Pi 为 **0.86.x**；仓库测试依赖升级不会升级全局 Pi。本仓库不会替你升级全局包。
 

@@ -1,15 +1,16 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
-	type ExtensionAPI, type ExtensionFactory, type SessionEntry,
+	type AgentSession, type ExtensionAPI, type ExtensionFactory, type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import {
 	createAssistantMessageEventStream, type Api, type AssistantMessage, type Model, type ToolCall, type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { registerToolSearch } from "../src/lifecycle.ts";
+import { globalToolSearchConfigPath, type ToolSearchProjectConfig } from "../src/config.ts";
 
 export function fixtureModel(api: Api = "openai-responses", native = true): Model<Api> {
 	const compat = native ? {
@@ -30,11 +31,34 @@ export function toolCall(name: string, args: ToolCall["arguments"] = {}): ToolCa
 	return { type: "toolCall", id: `fixture_call_${++nextCall}`, name, arguments: args };
 }
 
+export function mockModel(session: AgentSession) {
+	const requests: TranscriptContext[] = [];
+	const responses: AssistantMessage["content"][] = [];
+	session.agent.getApiKey = () => "fixture-not-a-real-key";
+	session.agent.streamFunction = (model, context) => {
+		requests.push(structuredClone(context));
+		const content = responses.shift() ?? [{ type: "text", text: "ok" }];
+		const message: AssistantMessage = {
+			role: "assistant", content, api: model.api, provider: model.provider, model: model.id,
+			usage: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 11, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			stopReason: content.some((block) => block.type === "toolCall") ? "toolUse" : "stop", timestamp: Date.now(),
+		};
+		const stream = createAssistantMessageEventStream();
+		queueMicrotask(() => {
+			stream.push({ type: "done", reason: message.stopReason as "toolUse" | "stop", message });
+			stream.end();
+		});
+		return stream;
+	};
+	return { requests, responses };
+}
+
 export async function sdkFixture(options: {
 	model?: Model<Api>;
 	tools?: string[];
 	entries?: SessionEntry[];
 	customPrompt?: string;
+	config?: ToolSearchProjectConfig;
 	providerName?: string;
 	beforeLoader?: ExtensionFactory;
 	extension?: ExtensionFactory;
@@ -76,6 +100,7 @@ export async function sdkFixture(options: {
 		],
 	});
 	try {
+		if (options.config) await writeFile(globalToolSearchConfigPath(root), JSON.stringify(options.config));
 		await resourceLoader.reload();
 		if (resourceLoader.getExtensions().errors.length) throw new Error(JSON.stringify(resourceLoader.getExtensions().errors));
 		const modelRuntime = await ModelRuntime.create({
@@ -89,24 +114,7 @@ export async function sdkFixture(options: {
 			model: options.model ?? fixtureModel(), ...(options.tools ? { tools: options.tools } : {}),
 		});
 		await session.bindExtensions({ mode: "print", onError: (error) => errors.push(error) });
-		const requests: TranscriptContext[] = [];
-		const responses: AssistantMessage["content"][] = [];
-		session.agent.getApiKey = () => "fixture-not-a-real-key";
-		session.agent.streamFunction = (model, context) => {
-			requests.push(structuredClone(context));
-			const content = responses.shift() ?? [{ type: "text", text: "ok" }];
-			const message: AssistantMessage = {
-				role: "assistant", content, api: model.api, provider: model.provider, model: model.id,
-				usage: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 11, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-				stopReason: content.some((block) => block.type === "toolCall") ? "toolUse" : "stop", timestamp: Date.now(),
-			};
-			const stream = createAssistantMessageEventStream();
-			queueMicrotask(() => {
-				stream.push({ type: "done", reason: message.stopReason as "toolUse" | "stop", message });
-				stream.end();
-			});
-			return stream;
-		};
+		const { requests, responses } = mockModel(session);
 		return {
 			root, session, sessionManager, settingsManager, requests, responses, errors,
 			get providerAPI() { return providerAPI; },

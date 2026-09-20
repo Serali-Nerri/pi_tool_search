@@ -64,6 +64,7 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 	let pendingGuidance: string | undefined;
 	let cancelGuidanceProjection: (() => void) | undefined;
 	let mode: "auto" | "eager" = "auto";
+	let customPrefix = false;
 	let native = false;
 	let standardPrompt = true;
 	let warnedTemplate = false;
@@ -206,8 +207,8 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 		return collision
 			? "collision: another extension owns tool_search; no tools were deferred"
 			: useDeferred()
-				? `on · ${native ? "native" : "portable"} · ${deferred.length - loadedCount} deferred · ${loadedCount} loaded · ${catalog.withPolicy("always").length} always · ${catalog.withPolicy("excluded").length} excluded${native ? "" : " · loading changes the ordinary tools list; cache reuse may be affected"}`
-				: `${enabled ? "eager" : "off"} · ${deferred.length} deferred tools restored · ${catalog.withPolicy("excluded").length} excluded · ${!enabled || mode === "eager" ? "explicit setting" : "custom/forced prompt or tool-section override"}`;
+				? `on · ${native ? "native" : "portable"} · ${deferred.length - loadedCount} deferred · ${loadedCount} loaded · ${catalog.withPolicy("always").length} always · ${catalog.withPolicy("excluded").length} excluded${customPrefix ? " · custom prefix" : ""}${native ? "" : " · loading changes the ordinary tools list; cache reuse may be affected"}`
+				: `${enabled ? "eager" : "off"} · ${deferred.length} deferred tools restored · ${catalog.withPolicy("excluded").length} excluded · ${!enabled || mode === "eager" ? "explicit setting" : "forced prompt or authored tools/rules section"}`;
 	};
 
 	registerLoader(true);
@@ -223,6 +224,7 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 		audit.reset();
 		native = supportsIncrementalTools(context.model);
 		standardPrompt = true;
+		customPrefix = false;
 		const config = await loadEffectiveToolSearchPolicies(cwd, context.isProjectTrusted(), agentDir);
 		globalPolicies = config.globalPolicies ?? new Map();
 		projectPolicies = config.projectPolicies ?? new Map();
@@ -260,6 +262,7 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 		const options = event.systemPromptOptions;
 		native = supportsIncrementalTools(context.model);
 		standardPrompt = hasStructuredToolMetadata(options);
+		customPrefix = standardPrompt && !!options.customPrompt;
 		if (refreshCatalog()) registerLoader();
 		// Invalidate the previous snapshot before accepting this run's metadata,
 		// including authored guideline overrides and explicit empty arrays.
@@ -272,7 +275,7 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 		if (!standardPrompt) {
 			if (enabled && mode === "auto" && !warnedTemplate) {
 				warnedTemplate = true;
-				const message = "pi-tool-search: custom/forced prompt or tool-section override; using fixed allowed tools. Use Pi's default structured prompt with append for deferred metadata.";
+				const message = "pi-tool-search: forceSystemPrompt or explicitly authored sections.tools/rules; using fixed allowed tools without rewriting the authored prompt. For deferred metadata, leave tool sections to tool-search and put other instructions in customPrompt, appendSystemPrompt or another named section.";
 				if (context.hasUI) context.ui.notify(message, "warning");
 				else console.warn(message);
 			}

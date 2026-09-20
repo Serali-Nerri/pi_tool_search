@@ -19,6 +19,11 @@ function options(selectedTools = ["read", "bash"]): BuildSystemPromptOptions {
 		toolGuidelines: { read: ["Read carefully"], alpha: ["Alpha guideline"] },
 		promptGuidelines: ["Do not delete files", "Do not delete files"],
 		contextFiles: [{ path: "/project/AGENTS.md", content: "Safety instructions" }],
+		skills: [{
+			name: "fixture", description: "Fixture skill", filePath: "/project/SKILL.md", baseDir: "/project",
+			sourceInfo: { path: "/project/SKILL.md", source: "local", scope: "temporary", origin: "top-level" },
+			disableModelInvocation: false,
+		}],
 		appendSystemPrompt: "Project role", sections: { task: "Current task" },
 	};
 }
@@ -40,11 +45,15 @@ test("structured metadata stays identical across activation, including implicit 
 });
 
 test("all registered snippets are available before activation and unrelated context stays intact", () => {
-	const input = options();
+	const input = { ...options(), customPrompt: "Safety role. Never delete files." };
+	assert.equal(hasStructuredToolMetadata(input), true);
 	const original = structuredClone(input);
 	assert.equal(toolSnippets(input).get("alpha"), "Alpha research");
 	stabilizeToolMetadata(input, entries, true);
+	assert.equal(input.customPrompt, original.customPrompt);
 	assert.deepEqual(input.contextFiles, original.contextFiles);
+	assert.deepEqual(input.skills, original.skills);
+	assert.equal(input.cwd, original.cwd);
 	assert.equal(input.appendSystemPrompt, original.appendSystemPrompt);
 	assert.equal(input.sections!.task, "Current task");
 	assert.deepEqual(input.toolSnippets, original.toolSnippets);
@@ -59,14 +68,23 @@ test("eager metadata includes allowed tools but excludes loader and excluded too
 	assert.doesNotMatch(JSON.stringify(input.sections), /tool_search|hidden/);
 });
 
-test("custom/forced prompts and authored tools/rules sections are opaque, never parsed", () => {
+test("forced prompts and explicitly authored tools/rules sections remain opaque", () => {
 	const extras: Partial<BuildSystemPromptOptions>[] = [
-		{ customPrompt: "Safety role" }, { forceSystemPrompt: "" },
-		{ customPrompt: "Role\n\nAvailable tools:\n- parent: Legacy parent metadata" },
-		{ customPrompt: "Role\n<tools>parent metadata</tools>" },
+		{ forceSystemPrompt: "" },
 		{ sections: { tools: "Authored tools" } }, { sections: { rules: "Authored rules" } },
 	];
 	for (const extra of extras) assert.equal(hasStructuredToolMetadata({ ...options(), ...extra }), false);
+});
+
+test("generic promptGuidelines survive even when identical text belongs to deferred or excluded tools", () => {
+	const input = options();
+	input.promptGuidelines = ["Alpha guideline", "Hidden guideline", "Authored rule"];
+	input.toolGuidelines!.hidden = ["Hidden guideline"];
+	const original = structuredClone(input.promptGuidelines);
+	stabilizeToolMetadata(input, entries, true);
+	assert.deepEqual(input.promptGuidelines, original);
+	for (const guide of original) assert.ok(input.sections!.rules.includes(`- ${guide}`));
+	assert.doesNotMatch(input.sections!.tools, /alpha|hidden/i);
 });
 
 test("multiline guidelines are preserved exactly once without string matching or prototype lookup", () => {

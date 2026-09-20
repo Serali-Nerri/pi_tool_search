@@ -44,6 +44,7 @@
     "@earendil-works/pi-server": "0.86.0",
     "@earendil-works/pi-tui": "0.86.0",
     "@types/node": "^24.0.0",
+    "pi-subagents-lite": "1.14.0",
     "tsx": "^4.23.12",
     "typebox": "^1.3.7",
     "typescript": "^5.9.3"
