@@ -1,8 +1,10 @@
-import type { ContextEvent, TurnEndEvent } from "@earendil-works/pi-coding-agent";
+import type { SessionEntry, TurnEndEvent } from "@earendil-works/pi-coding-agent";
+import { sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
 import { TOOL_SEARCH_NAME } from "./registry.ts";
 
-type Message = ContextEvent["messages"][number];
 type ToolResult = TurnEndEvent["toolResults"][number];
+export const TOOL_SEARCH_STATE_ENTRY = "pi-tool-search.state";
+export const TOOL_SEARCH_GUIDANCE_MESSAGE = "pi-tool-search.guidance";
 
 export function stringArray(value: unknown): string[] | undefined {
 	return Array.isArray(value) && value.every((item) => typeof item === "string") ? [...new Set(value)] : undefined;
@@ -19,65 +21,53 @@ export function activationDetails(message: ToolResult): {
 	};
 }
 
-/**
- * Repair Pi's additive wrapper bookkeeping without changing stored transcripts.
- * Decisions for live non-loader results are captured once at turn_end, not
- * recomputed against future policies. No payload serialization or disk I/O.
- */
-export class ActivationHistory {
-	private corrections = new Map<string, string[]>();
-	private cache = new WeakMap<Message, Message>();
+/** Read-only migration boundary. Pi 0.86 never emits or consumes this old field. */
+function legacyAddedToolNames(message: unknown): string[] | undefined {
+	return message && typeof message === "object" && "addedToolNames" in message
+		? stringArray(message.addedToolNames) : undefined;
+}
 
-	reset(): void {
-		this.corrections.clear();
-		this.cache = new WeakMap();
-	}
-
-	recordIncidental(results: readonly ToolResult[], managedNames: ReadonlySet<string>): Array<[string, string[]]> {
-		const recorded: Array<[string, string[]]> = [];
-		for (const message of results) {
-			if (message.toolName === TOOL_SEARCH_NAME || !message.addedToolNames?.length) continue;
-			const approved = message.addedToolNames.filter((name) => !managedNames.has(name));
-			if (approved.length === message.addedToolNames.length) continue;
-			this.corrections.set(message.toolCallId, approved);
-			recorded.push([message.toolCallId, approved]);
-			this.cache.delete(message);
-		}
-		return recorded;
-	}
-
-	restore(value: unknown): void {
-		if (!Array.isArray(value)) return;
-		for (const row of value) {
-			if (!Array.isArray(row) || typeof row[0] !== "string") continue;
-			const names = stringArray(row[1]);
-			if (names) this.corrections.set(row[0], names);
+/** Local intent is source-bound; upstream tool deltas contain schemas, not policy identities. */
+export function restoredState(entries: readonly SessionEntry[]): {
+	enabled: boolean; loaded: Set<string>; loadedKeys: Set<string>;
+} {
+	let enabled = true;
+	let stateIndex = -1;
+	let savedLoaded: string[] = [];
+	let savedKeys: string[] = [];
+	for (const [index, entry] of entries.entries()) {
+		if (entry.type !== "custom" || entry.customType !== TOOL_SEARCH_STATE_ENTRY) continue;
+		const value = entry.data as { enabled?: unknown; loaded?: unknown; loadedKeys?: unknown } | undefined;
+		if (typeof value?.enabled === "boolean") {
+			enabled = value.enabled;
+			savedKeys = stringArray(value.loadedKeys) ?? [];
+			savedLoaded = savedKeys.length ? [] : stringArray(value.loaded) ?? [];
+			stateIndex = index;
 		}
 	}
-
-	sanitize(messages: Message[]): Message[] {
-		let changed = false;
-		const next = messages.map((message) => {
-			const cached = this.cache.get(message);
-			if (cached) { changed ||= cached !== message; return cached; }
-			let result = message;
-			if (message.role === "toolResult" && message.addedToolNames?.length) {
-				const approved = message.toolName === TOOL_SEARCH_NAME
-					? message.isError ? [] : activationDetails(message).added
-					: this.corrections.get(message.toolCallId);
-				// Legacy loader results without structured details retain their records.
-				if (approved) {
-					const allowed = new Set(approved);
-					const additions = message.addedToolNames.filter((name) => allowed.has(name));
-					if (additions.length !== message.addedToolNames.length) {
-						result = { ...message, addedToolNames: additions.length ? additions : undefined };
-					}
-				}
-			}
-			this.cache.set(message, result);
-			changed ||= result !== message;
-			return result;
-		});
-		return changed ? next : messages;
+	const loaded = new Set<string>(enabled ? savedLoaded : []);
+	const loadedKeys = new Set<string>(enabled ? savedKeys : []);
+	if (!enabled) return { enabled, loaded, loadedKeys };
+	for (const entry of entries.slice(stateIndex + 1)) {
+		for (const message of sessionEntryToContextMessages(entry)) {
+			if (message.role !== "toolResult" || message.toolName !== TOOL_SEARCH_NAME || message.isError) continue;
+			const details = activationDetails(message);
+			if (details.loadedKeys) for (const key of details.loadedKeys) loadedKeys.add(key);
+			else for (const name of details.active ?? details.added ?? legacyAddedToolNames(message) ?? []) loaded.add(name);
+		}
 	}
+	return { enabled, loaded, loadedKeys };
+}
+
+/** Inspect compacted context only on restore, not on every model request. */
+export function pendingGuidanceCompaction(entries: readonly SessionEntry[]): string | undefined {
+	let pending: string | undefined;
+	for (const entry of entries) {
+		if (entry.type === "compaction") pending = entry.id;
+		if (entry.type === "custom_message" && entry.customType === TOOL_SEARCH_GUIDANCE_MESSAGE) {
+			const details = entry.details as { compactionId?: unknown } | undefined;
+			if (pending === details?.compactionId) pending = undefined;
+		}
+	}
+	return pending;
 }

@@ -21,14 +21,9 @@ function cleanDescription(description: string | null | undefined): string {
 		.trim();
 }
 
-function firstSentence(text: string): string {
-	const match = text.match(/^.*?[.!?。！？](?=\s|$|[A-Z\u4e00-\u9fff])/u);
-	return match?.[0]?.trim() || text;
-}
-
 function clampToolText(text: string, maxBytes: number): string {
 	if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
-	const ellipsis = "…";
+	const ellipsis = utf8Prefix("…", Math.max(0, maxBytes));
 	const prefix = utf8Prefix(text, Math.max(0, maxBytes - Buffer.byteLength(ellipsis, "utf8")));
 	const boundary = Math.max(prefix.lastIndexOf(" "), prefix.lastIndexOf(","), prefix.lastIndexOf(";"));
 	const clipped = boundary >= Math.floor(prefix.length * 0.6) ? prefix.slice(0, boundary) : prefix;
@@ -36,8 +31,8 @@ function clampToolText(text: string, maxBytes: number): string {
 }
 
 export function shortToolDescription(description: string | null | undefined, maxBytes = TOOL_DESCRIPTION_MAX_BYTES): string {
-	const cleaned = firstSentence(cleanDescription(description));
-	if (!cleaned) return "No description provided";
+	// Do not guess sentence boundaries: abbreviations and version numbers are common.
+	const cleaned = cleanDescription(description) || "No description provided";
 	return clampToolText(cleaned, maxBytes);
 }
 

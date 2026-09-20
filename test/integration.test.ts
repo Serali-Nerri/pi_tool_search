@@ -12,11 +12,10 @@ import { policyRecordKey, type ToolPolicy, type ToolPolicyRecord } from "../src/
 const testRoot = mkdtempSync(`${tmpdir()}/pi-tool-search-lifecycle-`);
 process.env.PI_CODING_AGENT_DIR = testRoot;
 after(() => rmSync(testRoot, { recursive: true, force: true }));
-const nativeModel = { api: "openai-responses", compat: { supportsAdditionalTools: true } };
-const prompt = "Role\n\nAvailable tools:\n- read: Read files\n\nIn addition to the tools above, more tools.\n\nGuidelines:\n- Be concise in your responses\n\nPi documentation (help)\nContext";
+const nativeModel = { api: "openai-responses", compat: { supportsMidConvoSystemMessages: true, supportsAdditionalTools: true } };
 function completeEvent(event: string, args: unknown[]): unknown[] {
 	if (event !== "before_agent_start") return args;
-	return [{ systemPrompt: prompt, systemPromptOptions: { cwd: testRoot, toolSnippets: { read: "Read files" } }, ...(args[0] as object) }, ...args.slice(1)];
+	return [{ systemPrompt: "", systemPromptOptions: { cwd: testRoot, selectedTools: [], toolSnippets: { read: "Read files" }, toolGuidelines: {}, sections: {} }, ...(args[0] as object) }, ...args.slice(1)];
 }
 
 interface RuntimeTool {
@@ -58,7 +57,7 @@ interface HarnessOptions {
 	externalTools?: ExternalTool[];
 	activeTools?: string[];
 	refreshActivatesAllowlist?: boolean;
-	/** Raw startup prompt used to capture prompt snippets before deferral. */
+	/** Opaque startup text; metadata is read only from structured event inputs. */
 	systemPrompt?: string;
 }
 
@@ -297,29 +296,22 @@ test("activates exact deferred names additively without changing the manifest", 
 	assert.match(typo.content[0].text, /Did you mean: web_search/);
 });
 
-test("tool_search relocates prompt snippets captured before deferral", async () => {
-	const harness = await startHarness({
-		externalTools,
-		systemPrompt: [
-			"Role",
-			"",
-			"Available tools:",
-			"- read: Read files",
-			"- web_search: Use for web research questions. Prefer queries with varied angles.",
-			"",
-			"In addition to the tools above, more tools.",
-			"",
-			"Guidelines:",
-			"- Be concise in your responses",
-			"",
-			"Pi documentation (help)",
-		].join("\n"),
-	});
+test("tool_search uses structured snippets even when the tool was already deferred", async () => {
+	const harness = await startHarness({ externalTools });
+	assert.equal(harness.getActiveTools().includes("web_search"), false);
+	await harness.emitAsync("before_agent_start", {
+		systemPromptOptions: {
+			cwd: testRoot,
+			toolSnippets: { web_search: "Use for web research questions. Prefer queries with varied angles." },
+			toolGuidelines: { web_search: ["Use current structured guidance."] },
+		},
+	}, extensionContext());
 	const search = harness.tool("tool_search");
 	assert.ok(search.execute);
 	const result = await search.execute("search-snippet", { tool_names: ["web_search"] });
 	assert.match(result.content[0].text, /- web_search: Use for web research questions\. Prefer queries with varied angles\./);
 	assert.doesNotMatch(result.content[0].text, /- web_search: Search the web$/m);
+	assert.match(result.content[0].text, /Use current structured guidance/);
 });
 
 test("uses a compact status row and keeps full diagnostics expanded", async () => {
@@ -366,6 +358,25 @@ test("uses a compact status row and keeps full diagnostics expanded", async () =
 	for (const width of [1, 2, 3, 4]) {
 		for (const line of rendered(expandedResult, width)) assert.ok(visibleWidth(line) <= width);
 	}
+});
+
+test("successful loading is not rendered as an error because guidance says disabled or unavailable", async () => {
+	const harness = await startHarness({ externalTools: [
+		...externalTools,
+		{ name: "check_disabled", description: "Inspect disabled or unavailable resources", source: "npm:fixture" },
+	] });
+	const search = harness.tool("tool_search");
+	const args = { tool_names: ["check_disabled"] };
+	const state: Record<string, unknown> = {};
+	const call = callComponent(search, args, { id: "keywords", state, executionStarted: true, isPartial: true });
+	const result = await search.execute!("keywords", args);
+	resultComponent(search, result, args, { id: "keywords", state });
+	assert.deepEqual(rendered(call), ["✓ Activated check_disabled"]);
+	await harness.command("tool-search").handler("off", extensionContext());
+	const disabled = await search.execute!("disabled", args);
+	assert.equal(disabled.details.disabled, true);
+	resultComponent(search, disabled, args, { id: "keywords", state });
+	assert.match(rendered(call)[0], /^✗ Tool search mode is disabled/);
 });
 
 test("slash command restores and re-defers managed tools using the new state key", async () => {
@@ -620,7 +631,7 @@ test("portable mode off and on restore allowed tools and reset loaded state", as
 
 test("unrecognized prompt falls back without modifying the supplied role", async () => {
 	const harness = await startHarness({ externalTools });
-	const results = await harness.emitAsync("before_agent_start", { systemPrompt: "Custom safety instructions" }, extensionContext());
+	const results = await harness.emitAsync("before_agent_start", { systemPromptOptions: { cwd: testRoot, customPrompt: "Custom safety instructions" } }, extensionContext());
 	assert.deepEqual(results, [undefined]);
 	assert.equal(harness.getActiveTools().includes("tool_search"), false);
 	assert.equal(harness.getActiveTools().includes("web_search"), true);
@@ -754,7 +765,10 @@ test("masked global edits keep deferred tools loaded and persist their activatio
 		const resumed = createHarness({ agentDir: fixture.agentDir, externalTools });
 		await resumed.emitAsync("session_start", {}, {
 			...fixture.context,
-			sessionManager: { getBranch: () => [{ type: "custom", ...state }] },
+			sessionManager: {
+				getBranch: () => [{ type: "custom", ...state }],
+				buildContextEntries: () => [{ type: "custom", ...state }],
+			},
 		});
 		assert.equal(resumed.getActiveTools().includes("web_search"), true);
 	}

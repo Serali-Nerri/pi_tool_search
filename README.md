@@ -1,108 +1,113 @@
 # pi-tool-search
 
-Pi 的按需工具加载扩展，支持主会话和子会话。保留稳定的工具目录和提示指南，使用 Pi 的原生增量协议或通用 active-tools 回退按需提供完整工具定义。
+Pi 的按需工具加载扩展，支持主会话与子会话。保留稳定、有界的工具目录，通过精确名称加载完整工具定义；工具传输和增量历史由 Pi 原生处理。
 
-验证基线：Pi **0.85.1**、`pi-web-access` **0.29.0**。不需要修改这些已安装包的源码。
+**运行及验证基线：Pi 0.86.x（开发依赖锁定 0.86.0）、Node.js 22.19+。** 可以恢复旧版 tool-search 会话，但不再支持 Pi 0.85 运行时；版本不匹配时在注册工具前明确报错。无需修改其他已安装扩展。
 
 ## 工作方式
-
-- `tool_search` 按精确名称加载 1–5 个允许的 deferred 工具；目标已经在当前工具列表中时直接调用，无需再次搜索。
-- manifest 保留完整的允许延迟加载目录，已加载工具不从目录删除。普通加载不重新 `registerTool()`，不会因重新注册 loader 而触发 Pi 的白名单全量激活。
-- manifest 最多 8 KiB；单项短描述最多 160 UTF-8 bytes，不包含完整 JSON Schema。超过预算的条目会标明省略数量，知道精确名称时仍可加载。
-- 默认 `always` 的工具（如 grep/find）的 `promptGuidelines` 保留。deferred 工具的 snippet 与 guidelines 都不进入系统提示：激活时随 `tool_search` 的结果文本返回（预算 8 KiB），因此系统提示在激活前后保持字节不变；归属与迁移细节见下文《工具元数据的归属与迁移》。
-- 只规范化可识别的 Pi 默认 `Available tools` 和 `Guidelines` 块；角色、项目、安全指令及其他上下文正常更新，不冻结整个系统提示。
-- 在全部 `session_start` 回调结束后的 `resources_discover` 阶段同步工具目录、恢复已加载状态并应用策略。像 `@mjakl/pi-processes` 这样在启动回调里注册的工具，首条消息前就按策略进入 manifest，未激活时隐藏完整定义；`/reload` 采用相同处理。
-- 在 `turn_end` 重申 active 子集，并校正附带激活的历史记录，避免其他扩展注册工具时把未请求工具泄漏到后续请求。
-- 每个会话独立维护 loaded 状态。恢复时优先使用成功加载结果中的提供者身份；项目策略和相对提供者路径使用 `ctx.cwd`，全局策略使用 agent 目录，适配 child cwd 和 worktree。
-
-调用示例：
 
 ```json
 { "tool_names": ["web_search", "fetch_content"] }
 ```
 
+- `tool_search` 按精确名称加载 1–5 个允许的 deferred 工具。目标已在当前工具列表中时直接调用，无需再次加载。
+- manifest 保留完整的允许延迟加载目录，已加载工具不从目录删除。普通加载不重新 `registerTool()`，不改变 loader 的定义。
+- manifest ≤8 KiB，单项短描述 ≤160 UTF-8 bytes，不包含完整参数 schema。描述清洗后按字节截断，不猜测缩写或版本号中的句号是否为句末。超过预算的条目标明省略数量，知道精确名称时仍可加载。
+- 每个会话独立维护 loaded 状态；激活结果用提供者身份记录，替换同名工具的提供者不会继承原提供者的激活。
+- 指南交付依据本扩展的首次授权加载状态，而不是 Pi 瞬时的 active 列表：即使同批其他工具注册时附带激活了目标，首次加载仍会返回指南；重复加载不重复返回。结果中的 `added` 表示首次授权加载或重新激活，provider 的工具差量仍由 Pi 独立计算。
+- 延迟的是模型可见 schema，不是扩展模块初始化；fresh child 仍需初始化其显式扩展。
+- 在全部 `session_start` 回调完成后的 `resources_discover` 阶段同步目录、恢复状态并应用策略。启动时动态注册的工具首条消息前即可进入 manifest；`/reload` 同样处理。
+- `turn_end` 重申 active 子集，防止其他扩展注册工具时，Pi 的显式白名单刷新附带激活未请求的工具。
+
 策略分为 `always`、`deferred`、`excluded`：
 
-- `read`、`bash`、`edit`、`write` 与 `tool_search` 锁定为 `always`：不可在配置面板或 JSON 中更改，旧配置中它们的 `excluded/deferred` 值不生效。这是本扩展唯一的不可更改项。固定展示模式不暴露 loader。
-- `grep`、`find`、`ls` 默认 `always`，但可自行改为 `deferred` 或 `excluded`。
-- `powershell` 默认 `excluded`，可自行调整。
-- 其他原本 active 的工具默认 `deferred`，需要时通过 `tool_search` 激活；原本 inactive 的工具默认 `excluded`，都可通过策略调整。
-- 子会话只处理它的白名单内、实际已注册工具：锁定工具不会给缺少它们的会话补上，也不会加载未列入白名单的目标。
-- 除五个锁定工具及上述命名默认策略外，本扩展不对工具名做特殊处理：是否可用只看注册、白名单与策略。工具选择不是操作系统权限沙箱。
+- `read`、`bash`、`edit`、`write`、`tool_search` 锁定为 `always`，JSON 和配置面板均不能改变。固定展示模式不暴露 loader。
+- `grep`、`find`、`ls` 默认 `always`，但可以修改；`powershell` 默认 `excluded`，同样可以修改。
+- 其他原本 active 的工具默认 `deferred`；原本 inactive 的工具默认 `excluded`。
+- 子会话只处理其白名单内实际注册的工具，锁定策略不会凭空补齐缺少的工具。
+- 工具选择不是操作系统权限沙箱，不对其他工具名作特殊处理。
 
-## 工具元数据的归属与迁移
+## Pi 0.86：结构化提示词与工具历史
 
-模型能看到工具元数据的四条途径，以及本扩展在 `mode: "auto"` 下的控制方式：
+本扩展不再解析 `Available tools:` / `Guidelines:` 标记，也不返回整段 `{ systemPrompt }`。
 
-| 途径 | 内容 | 位置 | 时机 |
-|---|---|---|---|
-| manifest | 每个 deferred 工具的 `名字 — 短描述`（单项 ≤160 B，总量 ≤8 KiB） | `tool_search` 的 description | 每轮请求 |
-| 参数 schema | 该工具的 `description` + `parameters` | provider `tools` 数组；`native` 路径下激活后为 `input` 里的内联定义 | 仅在该工具 active 时 |
-| 系统提示块 | `Available tools:` 的一行（来源 `promptSnippet`）与 `Guidelines:` 条目（来源 `promptGuidelines`） | 系统提示词 | 每轮请求，只列出策略允许且确有 snippet 的工具 |
-| 执行结果 | 本次激活工具的 snippet + 全部 `promptGuidelines`（总量 ≤8 KiB，去重、空白折叠） | `tool_search` 的返回文本 | 仅在调用 `tool_search` 之后 |
+`before_agent_start` 的 `systemPromptOptions.toolSnippets` 和 `toolGuidelines` 已包含未激活工具的元数据。扩展直接读取这些结构化输入（也保留此前处理器对单个工具指南的覆盖），通过 `sections.tools`、`sections.rules` 生成稳定的展示内容：
 
-按策略的三条结果：
+| 策略 | 工具定义 | 提示元数据 |
+|---|---|---|
+| `always` | 正常发送 | snippet 和指南正常展示 |
+| `deferred`，未加载 | 仅 manifest 中的名字和短描述 | 不写入系统提示 |
+| `deferred`，已加载 | Pi 在下一次模型请求中提供 schema | 首次加载结果中交付 snippet 与指南，总量 ≤8 KiB |
+| `excluded` | 不加入当前可调用工具集 | 不出现在当前 manifest 和本扩展生成的提示元数据中 |
 
-- `always`：schema 与两块元数据照常进入请求。本扩展只重建这两个块的内容，不冻结角色/安全/项目文本；没有 `promptSnippet` 的常驻工具不会出现在 `Available tools:`，但 schema 照常发送。
-- `deferred`：从 active 集合移除，schema 不进请求、只留 manifest；snippet 与 guidelines 也不写回系统提示。激活时才随 `tool_search` 结果交付。
-- `excluded`：schema、manifest、提示词三处都不出现。
+`selectedTools` 始终表示**实际可执行工具集**，不会为了隐藏说明而禁用已加载工具。展示集合单独计算，连激活 grep/find/ls 时的默认 shell 探索指南也保持稳定。常驻工具指南、自定义 `promptGuidelines`、其他命名 sections、项目文件、角色和安全上下文不被冻结。
 
-因此激活不会改写系统提示词：真实会话实测 `4393 → 4393` bytes（`process` 场景 `4390 → 4390`），`Available tools:` 与 `Guidelines:` 两块在激活前后完全一致。
+Pi 将初始提示词和工具定义记录在 transcript 的首个 system 消息中，之后追加 `sections`、`toolsAdded`、`toolsRemoved` 差量。本扩展不再生成 activation-corrections，也不在每次模型请求中遍历、改写旧的 `addedToolNames`。
 
-**snippet 的来源。** Pi 只为 active 工具渲染 snippet，`getAllTools()` 返回的 `ToolInfo` 不含 `promptSnippet`，`ExtensionAPI` 也没有 `getToolDefinition()`。本扩展在工具被延迟之前捕获：
+仍保留本扩展自己的策略、enabled 和来源身份：Pi 的工具声明不包含策略身份，不能代替这些信息。旧会话恢复时优先使用成功 loader 结果中的 `details.loadedKeys` / `active` / `added`，只在缺少结构化记录时读取旧 `addedToolNames`。旧 corrections 条目不再需要回放，不改写原始会话文件。
 
-- `session_start`、`resources_discover`、`session_tree`：解析 `ctx.getSystemPrompt()` 的 `Available tools:` 块（发生在 `applyMode()` 之前，此时全部工具仍是 active）；
-- `before_agent_start`：从 `event.systemPromptOptions.toolSnippets` 刷新，覆盖常驻工具与已激活工具；
-- 结果文本的标题行优先使用捕获值（清洗 + 160 B 截断），缺失或空白时回退到受限 short description；捕获结果按工具名保存在会话级 map，`session_shutdown` 清空。
+### 自定义提示词与子会话
 
-生命周期钩子一览：
+如果本扩展运行时已经存在 `customPrompt`、`forceSystemPrompt`，或其他扩展显式提供了 `sections.tools` / `sections.rules`，则保守回退 **eager**：原始内容不被解析或改写，仍遵守排除策略与白名单。
 
-| 钩子 | 作用 |
+**迁移注意：** 将父会话整段渲染后的提示词复制为子会话 `customPrompt`，也属于此回退范围，即使里面有旧标记或 XML 标签。要让子会话继续按需加载，应使用 Pi 默认结构化提示词，通过 append 或非 tools/rules 的命名 section 传递额外角色和任务要求，不复制父会话的工具说明。
+
+后于本扩展运行的其他事件处理器仍可修改提示词、强制替换提示词或改写请求；这些修改不属于本扩展的稳定性保证。
+
+### 压缩后的指南恢复
+
+已加载工具不因 compaction 自动卸载。但首次加载结果可能被压缩掉，因此扩展在压缩边界有界补发当前已加载、策略仍允许工具的指南：
+
+- 空闲时压缩：在下一条用户消息的 `before_agent_start` 中交付并持久化。
+- 运行中压缩：注册一次性的 `context` 处理器，为立即下一次请求补充指南，再于安全的 turn 边界持久化。不扫描历史，不改变 schema，不触发额外模型轮次；即使 Pi 已经取走其他 steering 消息也不会延迟交付。首次投影和持久化后的消息位置不同，此压缩恢复边界不保证完整消息前缀的字节稳定。
+- resume/tree 恢复：只在恢复时检查压缩后的上下文，按 compaction ID 避免重复补发；中断在压缩后、补发前的会话也可恢复。
+
+指南消息为隐藏的 `pi-tool-search.guidance` 自定义消息；只含工具说明，不含项目提示词或凭据。
+
+## 模型、缓存与审计
+
+配置只有 `"mode": "auto"` 或 `"mode": "eager"`。`native` / `portable` 是状态中的**预期传输能力**，不是额外配置值，更不是服务端缓存命中的证明。
+
+`auto` 对所有模型按需加载，Pi 自行选择协议。native 状态要求当前 resolved model 明确声明 `supportsMidConvoSystemMessages: true`，以及对应能力：
+
+| API | 工具能力 |
 |---|---|
-| `session_start` / `resources_discover` / `session_tree` | 同步目录、恢复 loaded、捕获 snippet、应用策略 |
-| `before_agent_start` | 刷新 snippet；只规范化可识别的 Pi 元数据块（无该块时安全回退 eager） |
-| `turn_end` | 重申 active 子集、校正附带激活的历史记录 |
-| `context` | 按真实加载结果校正历史消息引用 |
-| `before_provider_request` | 可选请求审计 |
+| OpenAI / Codex / Azure Responses | `supportsAdditionalTools` 或 `supportsToolSearch` |
+| Anthropic Messages | `supportsMidConvoToolChanges` |
+| Chat Completions | `supportsMidConvoToolAdditions` |
 
-不受控制或需要留意的边界：
+其他情况标为 portable。不猜模型名，不修改模型 compat 标记；旧 `supportsToolReferences` 不再作为判断依据。
 
-- 判定标准只有那四个标记块（`Available tools:`、`In addition to the tools above,`、`Guidelines:`、`Pi documentation (`），不区分 `customPrompt`。子会话用父会话提示词覆盖系统提示时会同时继承整段 Pi 提示词，那两个块描述的是父会话的工具；本扩展同样会按子会话自己的目录与策略重建它们，否则子会话会把父会话的工具当成自己的。子会话自己重建过的块同样满足该判定。
-- 重建只认识有归属的行：父会话遗留且在本会话没有对应工具的 `Guidelines:` 条目不会被删除（子会话重建后整块被替换，遗留条目随之消失）。
+- Responses 原生路径将新增定义放在 `input` 增量项中；普通路径扩大顶层工具列表。
+- Anthropic 原生路径保留初始工具前缀、追加 deferred 声明，通过中途 system 消息执行工具增删，并非整个顶层 tools 永远不变。
+- 工具移除、同名 schema 重定义等可能迫使 Pi 使用完整当前工具列表；能力声明不保证每种历史都能原生表达。
+- 显式 eager 从首轮携带全部允许定义，不展示 loader。
+- 在目录、策略和其他提示内容不变时，普通激活保持 manifest 与工具提示 sections 稳定。修改策略/目录、换模型、模式切换、压缩和分支导航都是允许改变缓存前缀的边界。
 
-- 固定展示（`/tool-search off` 或 `mode: "eager"`）不做迁移：允许工具的 snippet 与 guidelines 照常出现在系统提示，`tool_search` 本身不展示；这是"显式固定"的语义。
-- 三个已知块之外的自由文本不在本扩展控制内。例如 `@mjakl/pi-processes` 早期版本在 `before_agent_start` 里追加的 `Background processes:` 段既不会被删除、也不属于本扩展的稳定性保证（本机已改用删除该钩子的本地 fork，不再出现该段）。
-- schema 内容不改写：不修改其他扩展的 `description` / `parameters`，只控制"何时发送、是否发送"。
-- 启动窗口之后才注册、且在首次捕获前就被延迟的工具，标题回退到 short description；`promptGuidelines` 不受影响（`ToolInfo` 一直提供）。
-- `ToolInfo` 不含 `promptSnippet` 是 Pi 当前接口限制；若上游补上，捕获逻辑可以退化为直接读取。
+排除/卸载是当前工具选择策略，不是擦除历史：已经发送过的定义、manifest 和指南可能仍在会话历史中。尤其 Anthropic 原生移除可保留旧顶层声明，再用 `tool_removal` 撤销当前可用性；本扩展不为隐藏历史内容而重写 transcript。
 
-## 模型和缓存边界
+实际收益应检查正常响应的 `usage.cacheRead`，不能仅凭请求结构断言命中。
 
-默认 `mode: "auto"` 对所有模型按需激活工具，具体传输由 Pi 根据当前 **resolved model** 处理，不猜模型名称。两种延迟路径都只增添请求的工具，并在当前会话中保持已加载状态，不会每轮重新加载或自动卸载。
+### 内置缓存保活
 
-`native` 和 `portable` 复用同一套 loader：模型调用 `tool_search`，扩展通过 `pi.setActiveTools()` 增添工具，Pi 在**下一次模型请求**中提供新定义。两条路径的激活时机和调用方式相同，差异在 Pi 的请求序列化方式及缓存特性。
+Pi 0.86 已内置成本感知的 `cacheWarming`，默认 `streaming`，可选 `off` / `idle`。是否保活取决于模型缓存寿命声明和成本估计，保活请求会计费。通过 Pi 的配置和 `/session` 查看即可；本扩展不添加定时器、额外保活请求或默认设置覆盖。
 
-| 有效行为 | 初始工具定义 | 激活后的请求 | 缓存边界 |
-|---|---|---|---|
-| `auto` → `native` | 常驻工具和 loader | 原生协议引入新定义 | 可维持工具前缀稳定 |
-| `auto` → `portable` | 常驻工具和 loader | 普通 `tools` 列表增添完整定义 | 激活时列表变化，可能影响前缀缓存 |
-| 显式 `eager` | 全部允许且未排除的工具，不展示 loader | 固定允许工具集 | 从首轮携带全部定义 |
+### 请求审计
 
-表中的原生请求结构以已联测的 OpenAI Responses 路径为例：新定义放在 `input` 的原生加载结构中，初始顶层 `tools` 可保持不变；通用路径则扩大普通 `tools` 列表。其他提供者采用各自的原生表示。
+审计默认关闭；开启后仅输出计数与 hash，不输出提示原文、工具结果或凭据。支持 Responses/Codex、Anthropic Messages、Chat Completions：
 
-`native` / `portable` 是 `/tool-search status` 根据模型能力声明标识的预期传输路径，不是额外 JSON 配置值，也不是请求抓包结果；配置仍为 `"mode": "auto"` 或 `"mode": "eager"`。原生能力声明包括 OpenAI Responses 的 `compat.supportsAdditionalTools` / `compat.supportsToolSearch`，以及 `anthropic-messages` 的 `compat.supportsToolReferences`。无声明时状态标为 `portable`。这些标记只用于状态说明，最终协议选择由 Pi 的提供者适配器完成；本扩展不修改模型兼容标记或请求协议。
+- 分别检查初始系统前缀、已有 system 补丁及已有内联工具定义和位置；合法尾部追加不视为修改历史。
+- Codex 的 `instructions` 和 `input` 中的 system/developer 补丁都会检查。
+- Anthropic 合法追加 deferred 声明单独标明；历史 system 补丁中的块级 `cache_control` 移动不误报为提示内容变化，文本和工具声明仍参与检查。
+- portable 首次加载出现 `top-level tools changed` 是预期行为；重复加载应再次稳定。
+- 不支持的格式显示 `unsupported payload` 并清除旧比较基线，不沿用陈旧成功状态。
+- reload、换模型、分支导航和 compaction 重置审计基线。
 
-自定义/无法识别的系统提示模板使用 **eager** 安全回退，原提示保持不变；需要延迟元数据时使用 Pi 默认提示。
+审计关闭时不读取 payload；开启时的哈希计算有 CPU 成本。该钩子之后的扩展仍可能修改请求。Pi 自身的缓存保活与本扩展的被动审计是不同功能。
 
-能力声明取自当前模型目录：没有声明增量工具能力的模型仍可通过普通工具列表按需加载。切换模型时保留当前会话已加载的工具，不会因为传输路径变化就启用所有 deferred 工具；换模型本身不属于缓存稳定性保证。
+## 全局与项目策略
 
-在工具目录、策略、模型和其他提示内容不变时，两种延迟路径都保持 manifest 稳定，系统提示在激活前后字节不变（deferred 指南随 `tool_search` 结果交付，不写回提示词）。原生路径还以保持顶层 tools 及既有内联工具定义的位置和内容稳定为目标；通用路径允许顶层 tools 在首次激活时扩大，重复加载同一工具不会重复增加定义。实际注册/删除工具、schema 或指南更新、修改策略、换模型、切换模式、压缩历史等都是允许改变缓存前缀的边界。其他扩展直接改写系统提示或请求的行为也不在本扩展的稳定性保证内。
-
-请求结构稳定只是缓存的客户端条件，**不保证服务端真实命中**。真实收益应检查正常模型响应的缓存用量，例如 Pi 的 `usage.cacheRead`。
-
-## tool-search 全局与项目策略
-
-全局文件：`~/.pi/agent/pi-tool-search.json`，本机为 `/home/thelya/.pi/agent/pi-tool-search.json`：
+全局文件：`~/.pi/agent/pi-tool-search.json`；设置 `PI_CODING_AGENT_DIR` 时使用其指定的 agent 目录。
 
 ```json
 {
@@ -112,21 +117,20 @@ Pi 的按需工具加载扩展，支持主会话和子会话。保留稳定的�
   "tools": [
     { "name": "web_search", "source": "npm:pi-web-access", "policy": "deferred" },
     { "name": "fetch_content", "source": "npm:pi-web-access", "policy": "deferred" },
-    { "name": "get_search_content", "source": "npm:pi-web-access", "policy": "deferred" },
-    { "name": "document_parse", "source": "npm:pi-docparser", "policy": "deferred" },
-    { "name": "document_search", "source": "npm:pi-docparser", "policy": "deferred" },
-    { "name": "document_screenshot", "source": "npm:pi-docparser", "policy": "deferred" }
+    { "name": "document_parse", "source": "npm:pi-docparser", "policy": "deferred" }
   ]
 }
 ```
 
-优先级为：受信任项目的 `<ctx.cwd>/.pi/pi-tool-search.json` > 全局配置 > 默认策略；五个锁定工具（read、bash、edit、write、tool_search）的规则最后生效。未受信任项目不读取项目策略。设置 `PI_CODING_AGENT_DIR` 的 Pi 使用其指定 agent 目录。
+优先级：受信任项目的 `<ctx.cwd>/.pi/pi-tool-search.json` > 全局配置 > 默认策略；五个锁定工具最后强制生效。未受信任项目不读取项目策略。child cwd/worktree 使用自己的项目目录，不使用工厂的进程 cwd。
 
-npm 来源与显式路径加载会规范化到同一提供者身份，策略保存使用规范化身份。相对路径以会话 cwd 为基准，已有路径的符号链接在身份与所有权检查中解析为真实路径。全局策略不能使缺少提供者扩展、或不在子会话白名单内的工具凭空可用。
+npm 来源与显式路径加载会规范化到同一提供者身份；相对路径以会话 cwd 为准，已有符号链接解析为真实路径。配置不会使缺少提供者或未在白名单中的工具凭空可用。
 
-配置文件限制 64 KiB。`/tool-search config` 保存到全局文件；`/tool-search config project` 保存到当前受信任项目的 `.pi/pi-tool-search.json`，项目记录优先于全局同名记录。
+SDK inline 工厂按完整工厂路径区分身份，例如 `<inline:provider-A>` 保存为 `inline:<inline:provider-A>`，不再共用 `inline`。SDK 调用方应使用唯一、稳定的具名工厂；未命名工厂的自动编号不能保证重排后的身份稳定。旧通用 `inline` 加载记录因缺少来源信息而不自动恢复，也不退回按工具名恢复；重新调用 loader 后会记录新身份。旧 `source: "inline"` 的 `always/deferred` 策略不自动分配给某个工厂，需重新配置；`excluded` 则保留约束，直到同层或更高层的明确工厂策略覆盖，或手动移除旧记录。迁移不会自动改写会话或配置文件。
 
-## 命令与请求审计
+文件限制 64 KiB。保存只合并实际修改的行，保留未注册提供者、其他未编辑记录及目标文件的 `mode`、`audit` 和其他字段；无修改退出不写文件。损坏、不可读、版本不支持、无效记录或符号链接配置均拒绝覆盖。同目录 `.lock` 避免并发保存丢失修改；确认没有写入者后才可手动移除异常退出遗留的锁。
+
+## 命令
 
 ```text
 /tool-search status
@@ -139,57 +143,54 @@ npm 来源与显式路径加载会规范化到同一提供者身份，策略保�
 /tool-search audit off
 ```
 
-`config` 默认写全局 `~/.pi/agent/pi-tool-search.json`；`config project` 写当前受信任项目的 `.pi/pi-tool-search.json`（要求项目已信任）。两者显示当前生效策略，但**只将实际修改的行合并到目标文件**：未编辑的项目覆盖值不会复制到全局，未注册提供者及其他未编辑记录会保留；无修改退出不写文件。项目覆盖仍优先于全局修改；若生效策略未改变，已经加载的 deferred 工具保持可用。
+- `config` 默认写全局；`config project` 仅允许写受信任项目。面板显示生效策略，但不会将未编辑的项目覆盖值复制到全局。
+- 项目策略仍优先于全局修改。如果生效策略没变，已加载工具保持可用。
+- `on` 清空 loaded，重新应用配置模式；显式 eager 不会因此变为 auto。
+- `off` 固定展示允许工具、隐藏 loader，excluded 仍不启用。
+- 非空闲时拒绝修改模式和策略；保存前再次检查空闲状态及项目信任。
+- 审计也可通过 `PI_TOOL_SEARCH_AUDIT=1` 或配置 `audit: true` 开启，配置在 reload/新会话读取。
 
-保存会保留目标文件的 `mode`、`audit` 和其他已有字段，并对合并后的文件执行 64 KiB 限制。损坏、不可读、版本不支持或包含无效记录的配置会拒绝覆盖；符号链接配置同样拒绝写入，不会替换链接或修改其目标，请直接编辑真实目标文件。保存使用同目录的 `.lock` 文件避免并发写入丢失修改；遇到锁占用请稍后重试。如果写入进程异常退出留下锁，只有确认没有写入者后才可手动移除该 `.lock` 文件。
-
-`on` 重新启用配置的加载策略并清空当前 loaded 集合；`auto` 下显示 `native` 或 `portable`，显式 `eager` 仍保持固定展示。`off` 固定恢复允许的 deferred 工具、隐藏 loader，`excluded` 工具仍不启用。非空闲时拒绝修改工具策略。
-
-审计默认关闭。开启后，在 `before_provider_request` 检查顶层工具、系统内容、既有内联工具定义及其位置，向 stderr 输出序号和 hash，不输出提示原文、工具结果或凭据；`audit status` 显示本会话最新结果。也可设置 `PI_TOOL_SEARCH_AUDIT=1` 或配置中的 `audit: true`，后者在 reload/新会话读取。
-
-通用延迟首次激活工具时，审计出现 `top-level tools changed` 是预期行为；随后没有新激活时应再次稳定。激活**不应**再触发 `system metadata changed`（deferred 指南已迁移到工具结果，系统提示保持字节不变）；若看到该提示，说明有其他扩展改写了系统提示。系统指南稳定不能抵消普通工具列表变化的缓存影响。当前审计 payload 解析面向 Responses 请求；不支持的格式会显示 `unsupported payload`。
-
-审计不发送额外模型请求、不重复加载扩展。开启时会扫描请求的相关部分并计算 hash；关闭时不读取请求 payload。正常运行仍需要工具目录检查和历史消息引用遍历，不应理解为零 CPU 成本。每个 fresh child 本来就要初始化其显式扩展，tool-search 延迟的是**模型可见 schema**，不是扩展模块的初始化。
-
-该钩子之后的其他扩展仍可能修改请求。当前测试覆盖本扩展的状态、提示词重写以及审计器对构造 payload 的检查，不包含回环 HTTP 服务或最终 provider 请求体的端到端回归。验证最终请求及缓存条件时，需要另外捕获实际发送的请求，不能只凭运行时 active 列表或审计钩子下结论。
-
-## 开发、测试与部署
-
-Node.js 22.19+（本机验证为 24.12.0）：
+## 开发、验证与部署
 
 ```bash
-npm install
+npm install --ignore-scripts
 npm run verify
 ```
 
-- `verify`：严格 TypeScript 检查及全套单元/集成测试，包含真实 Pi SDK 的启动顺序、reload、会话树分支切换和启动后注册工具的状态恢复、snippet 捕获与指南迁移的预算/回退断言、锁定集合与命名默认值、配置面板排序、全局/项目增量保存、错误与符号链接保护，以及相对路径/符号链接身份。配置写入测试使用隔离的临时 agent 目录，不修改真实全局配置。
-- 开发依赖包含 `@earendil-works/pi-server@0.85.0`，用于 Pi 0.85 顶层 SDK 导出的直接 Node 导入；不会部署它或修改全局 npm 包。
+测试包括类型检查、策略和身份安全、配置持久化、窄宽度渲染，以及：
 
-部署：
+- 真实 Pi SDK 的首条 `session.prompt()`、加载后立即使用、重复加载、启动/运行中注册、显式子会话白名单。
+- reload、resume、tree 分支恢复、模型切换、手动/运行中 compaction、已排队 steering 下的即时指南恢复。
+- inline 工厂身份隔离及旧记录保守迁移；同批注册与首次加载时的指南交付；目录变更后的新 snippet 与结构化指南覆盖（包括显式空数组）。
+- 真实 pi-ai provider 序列化：Responses、Codex、Anthropic、原生/普通 Chat Completions，及移除/重定义回退和审计兼容。
+
+SDK 测试使用临时 agent 目录与模拟模型响应；序列化测试在 `onPayload` 截获后终止，**不发送 HTTP、不调用真实模型、不验证服务端缓存命中**。这不是回环 HTTP 或远端端到端测试。开发依赖不随部署复制。
+
+部署前先确保目标 Pi 为 **0.86.x**；仓库测试依赖升级不会升级全局 Pi。本仓库不会替你升级全局包。
 
 ```bash
 npm run deploy
 ```
 
-`deploy` 先验证，再将 `src/` 部署到 `~/.pi/agent/extensions/pi-tool-search/`。先暂存完整新版本，用 rename 切换；失败尝试恢复旧版本。每次旧版本保留在 `~/.pi/agent/extension-backups/pi-tool-search-<时间>-<UUID>/`，不覆盖既有备份。接受 `--agent-dir PATH` 指定 agent 目录。
+部署先验证，再暂存 `src/` 并通过 rename 切换到 `~/.pi/agent/extensions/pi-tool-search/`；失败尝试恢复旧版本。每次旧版本保留在 `~/.pi/agent/extension-backups/pi-tool-search-<时间>-<UUID>/`，不覆盖已有备份。支持 `--agent-dir PATH`。
 
-策略直接编辑 JSON：全局 `~/.pi/agent/pi-tool-search.json`（`version`/`mode`/`audit`/`tools`），受信任项目用 `.pi/pi-tool-search.json` 覆盖。部署或改配置后**重启 Pi 或执行 `/reload`**；已运行中的会话不会被原地改配置。
-
-回滚时先停用相关会话：用备份的目录恢复原 tool-search，手动恢复改过的 JSON；不要覆盖后来新增的配置变更。
+部署或修改配置后重启 Pi 或执行 `/reload`。回滚时先停用相关会话，用备份恢复扩展目录和相匹配的 Pi 版本；手动恢复配置时不要覆盖后续新变更。
 
 ## 项目结构
 
 ```text
-src/lifecycle.ts       生命周期、模式、会话恢复和 active 子集
+src/lifecycle.ts       生命周期、模式、策略执行、指南恢复
 src/registry.ts        工具策略、提供者身份、目录变更检测
 src/config.ts          全局/项目策略读写与校验
-src/capabilities.ts    模型增量工具能力判断
-src/prompt.ts          有界且稳定的工具提示元数据
-src/history.ts         激活记录校正与恢复
-src/audit.ts           默认关闭的请求结构审计
-src/tool.ts            精确名称 loader 和紧凑渲染
+src/capabilities.ts    resolved-model 传输能力判断
+src/prompt.ts          结构化 tools/rules sections
+src/history.ts         来源绑定状态、旧会话读取及压缩恢复判断
+src/audit.ts           默认关闭的多协议请求结构审计
+src/tool.ts            精确名称 loader、有界指南和紧凑渲染
 src/manifest.ts        manifest 与短描述预算
 src/ui.ts              策略配置面板
-test/                  单元、集成、配置及部署测试
-scripts/               部署脚本
+test/                 单元、真实 SDK 与序列化回归
+scripts/              部署脚本
 ```
+
+上游参考：[0.86.0 发布说明](https://github.com/earendil-works/pi/releases/tag/v0.86.0) · [transcript 协议变更 #9548](https://github.com/earendil-works/pi/pull/9548) · [结构化提示词 API](https://github.com/earendil-works/pi/blob/v0.86.0/packages/coding-agent/docs/extensions.md#before_agent_start)

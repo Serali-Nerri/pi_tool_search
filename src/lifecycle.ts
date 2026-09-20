@@ -1,5 +1,5 @@
-import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { getAgentDir, sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, VERSION } from "@earendil-works/pi-coding-agent";
 import {
 	loadEffectiveToolSearchPolicies,
 	loadToolSearchPolicies,
@@ -15,50 +15,12 @@ import {
 	TOOL_SEARCH_NAME,
 	type ToolPolicy,
 } from "./registry.ts";
-import { createToolSearchDefinition } from "./tool.ts";
+import { buildToolGuidance, createToolSearchDefinition } from "./tool.ts";
 import { showToolSearchConfig } from "./ui.ts";
 import { supportsIncrementalTools } from "./capabilities.ts";
-import { activationDetails, ActivationHistory, stringArray } from "./history.ts";
-import { hasStandardToolMetadata, stabilizeToolMetadata, TOOLS_BLOCK_END, TOOLS_BLOCK_START } from "./prompt.ts";
+import { pendingGuidanceCompaction, restoredState, TOOL_SEARCH_GUIDANCE_MESSAGE, TOOL_SEARCH_STATE_ENTRY } from "./history.ts";
+import { hasStructuredToolMetadata, stabilizeToolMetadata, toolGuidelines, toolSnippets } from "./prompt.ts";
 import { RequestAudit } from "./audit.ts";
-
-const TOOL_SEARCH_STATE_ENTRY = "pi-tool-search.state";
-const TOOL_SEARCH_CORRECTIONS_ENTRY = "pi-tool-search.activation-corrections";
-
-interface RestoredState {
-	enabled: boolean;
-	loaded: Set<string>;
-	loadedKeys: Set<string>;
-}
-
-function restoredState(entries: readonly SessionEntry[]): RestoredState {
-	let enabled = true;
-	let stateIndex = -1;
-	let savedLoaded: string[] = [];
-	let savedKeys: string[] = [];
-	for (const [index, entry] of entries.entries()) {
-		if (entry.type !== "custom" || entry.customType !== TOOL_SEARCH_STATE_ENTRY) continue;
-		const value = entry.data as { enabled?: unknown; loaded?: unknown; loadedKeys?: unknown } | undefined;
-		if (typeof value?.enabled === "boolean") {
-			enabled = value.enabled;
-			savedKeys = stringArray(value.loadedKeys) ?? [];
-			savedLoaded = savedKeys.length ? [] : stringArray(value.loaded) ?? [];
-			stateIndex = index;
-		}
-	}
-	const loaded = new Set<string>(enabled ? savedLoaded : []);
-	const loadedKeys = new Set<string>(enabled ? savedKeys : []);
-	if (!enabled) return { enabled, loaded, loadedKeys };
-	for (const entry of entries.slice(stateIndex + 1)) {
-		for (const message of sessionEntryToContextMessages(entry)) {
-			if (message.role !== "toolResult" || message.toolName !== TOOL_SEARCH_NAME || message.isError) continue;
-			const details = activationDetails(message);
-			if (details.loadedKeys) for (const key of details.loadedKeys) loadedKeys.add(key);
-			else for (const name of details.active ?? details.added ?? message.addedToolNames ?? []) loaded.add(name);
-		}
-	}
-	return { enabled, loaded, loadedKeys };
-}
 
 function sameNames(left: readonly string[], right: readonly string[]): boolean {
 	if (left.length !== right.length) return false;
@@ -88,6 +50,7 @@ export async function saveToolSearchConfiguration(
 }
 
 export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath: string, agentDir = getAgentDir()): void {
+	if (!/^0\.86\./.test(VERSION)) throw new Error(`pi-tool-search requires Pi 0.86.x (running ${VERSION}). Update Pi before loading this extension.`);
 	let catalog = new ToolCatalog(cwd);
 	let globalPolicies = new Map<string, ToolPolicy>();
 	let projectPolicies = new Map<string, ToolPolicy>();
@@ -96,34 +59,15 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 	let lastDescription: string | undefined;
 	const loaded = new Map<string, string>();
 	const hiddenByThisExtension = new Set<string>();
-	// Pi only renders snippets for active tools and ToolInfo never exposes them,
-	// so remember every snippet seen while its tool was still active. Deferred
-	// tools keep their captured snippet until the session ends.
-	const snippets = new Map<string, string>();
-	const captureSnippets = (options?: { toolSnippets?: Record<string, string> }): void => {
-		for (const [name, snippet] of Object.entries(options?.toolSnippets ?? {})) {
-			const trimmed = snippet?.trim();
-			if (trimmed) snippets.set(name, trimmed);
-		}
-	};
-	// Pi hides deferred tools before before_agent_start ever sees them, so the
-	// startup prompt (and every reload) is the only place their snippets exist.
-	const captureSnippetsFromPrompt = (prompt: string | undefined): void => {
-		if (!prompt) return;
-		const start = prompt.indexOf(TOOLS_BLOCK_START);
-		const end = prompt.indexOf(TOOLS_BLOCK_END);
-		if (start < 0 || end < start) return;
-		for (const line of prompt.slice(start + TOOLS_BLOCK_START.length, end).split("\n")) {
-			const match = /^- ([A-Za-z0-9_.-]+): (.+)$/.exec(line.trim());
-			if (match?.[2]?.trim()) snippets.set(match[1], match[2].trim());
-		}
-	};
+	let snippets = new Map<string, string>();
+	let guidelines = new Map<string, readonly string[]>();
+	let pendingGuidance: string | undefined;
+	let cancelGuidanceProjection: (() => void) | undefined;
 	let mode: "auto" | "eager" = "auto";
 	let native = false;
 	let standardPrompt = true;
 	let warnedTemplate = false;
 	let auditEnabled = false;
-	const history = new ActivationHistory();
 	const audit = new RequestAudit();
 	// Pi chooses native inline definitions or its normal active-list fallback.
 	// Both transports support additive activation; only their cache behavior differs.
@@ -147,7 +91,10 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 		if (additions.length > 0) pi.setActiveTools([...new Set([...activeBefore, ...additions])]);
 		const activeAfter = new Set(pi.getActiveTools());
 		const active = requested.filter((name) => activeAfter.has(name));
-		const added = additions.filter((name) => activeAfter.has(name));
+		// A sibling tool may have incidentally activated the entire allowlist.
+		// First authorized loads still need guidance even if no setActiveTools
+		// addition was necessary. Pi computes protocol deltas independently.
+		const added = active.filter((name) => !activeSet.has(name) || loaded.get(name) !== catalog.byName(name)!.key);
 		for (const name of active) loaded.set(name, catalog.byName(name)!.key);
 		return { added, active };
 	};
@@ -160,6 +107,7 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 			owned: ownsLoader,
 			activate,
 			snippets: () => snippets,
+			guidelines: () => guidelines,
 		});
 		if (!force && definition.description === lastDescription) return;
 		lastDescription = definition.description;
@@ -207,21 +155,27 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 		}
 	};
 
-	const refreshCatalog = (): boolean =>
-		catalog.refresh(pi.getAllTools(), new Set(pi.getActiveTools()), globalPolicies, projectPolicies);
+	const refreshCatalog = (): boolean => {
+		const metadataNames = new Set([...snippets.keys(), ...guidelines.keys()]);
+		const previousEntries = new Map([...metadataNames].map((name) => [name, catalog.byName(name)]));
+		const changed = catalog.refresh(pi.getAllTools(), new Set(pi.getActiveTools()), globalPolicies, projectPolicies);
+		if (changed) for (const [name, previous] of previousEntries) {
+			const current = catalog.byName(name);
+			const replaced = previous?.key !== current?.key;
+			if (replaced || previous?.tool.description !== current?.tool.description) snippets.delete(name);
+			if (replaced || previous?.tool.promptGuidelines !== current?.tool.promptGuidelines) guidelines.delete(name);
+		}
+		return changed;
+	};
 
 	const restoreForContext = (context: ExtensionContext): void => {
-		const sessionManager = context.sessionManager as typeof context.sessionManager & {
-			getBranch?: () => SessionEntry[];
-		};
-		const entries = sessionManager.getBranch?.() ?? context.sessionManager.buildContextEntries();
+		const entries = context.sessionManager.getBranch();
 		const state = restoredState(entries);
 		enabled = state.enabled;
 		loaded.clear();
-		history.reset();
-		for (const entry of entries) {
-			if (entry.type === "custom" && entry.customType === TOOL_SEARCH_CORRECTIONS_ENTRY) history.restore(entry.data);
-		}
+		cancelGuidanceProjection?.();
+		cancelGuidanceProjection = undefined;
+		pendingGuidance = pendingGuidanceCompaction(context.sessionManager.buildContextEntries());
 		for (const name of state.loaded) {
 			const entry = catalog.byName(name);
 			if (entry?.policy === "deferred") loaded.set(name, entry.key);
@@ -232,6 +186,19 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 		}
 	};
 
+	const guidanceMessage = (compactionId: string) => {
+		if (collision || !useDeferred()) return undefined;
+		const active = new Set(pi.getActiveTools());
+		const entries = deferredEntries().filter((entry) => loaded.get(entry.tool.name) === entry.key && active.has(entry.tool.name));
+		const content = buildToolGuidance(entries.map((entry) => entry.tool.name), new Map(entries.map((entry) => [entry.tool.name, entry])), { snippets, guidelines });
+		return content ? {
+			customType: TOOL_SEARCH_GUIDANCE_MESSAGE,
+			content,
+			display: false,
+			details: { compactionId, loadedKeys: entries.map((entry) => entry.key) },
+		} : undefined;
+	};
+
 	const statusText = (): string => {
 		const deferred = catalog.withPolicy("deferred");
 		const active = new Set(pi.getActiveTools());
@@ -240,14 +207,15 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 			? "collision: another extension owns tool_search; no tools were deferred"
 			: useDeferred()
 				? `on · ${native ? "native" : "portable"} · ${deferred.length - loadedCount} deferred · ${loadedCount} loaded · ${catalog.withPolicy("always").length} always · ${catalog.withPolicy("excluded").length} excluded${native ? "" : " · loading changes the ordinary tools list; cache reuse may be affected"}`
-				: `${enabled ? "eager" : "off"} · ${deferred.length} deferred tools restored · ${catalog.withPolicy("excluded").length} excluded · ${!enabled || mode === "eager" ? "explicit setting" : "custom/unrecognized prompt template"}`;
+				: `${enabled ? "eager" : "off"} · ${deferred.length} deferred tools restored · ${catalog.withPolicy("excluded").length} excluded · ${!enabled || mode === "eager" ? "explicit setting" : "custom/forced prompt or tool-section override"}`;
 	};
 
 	registerLoader(true);
 
 	pi.on("session_start", async (_event, context) => {
 		cwd = context.cwd || cwd;
-		captureSnippetsFromPrompt(context.getSystemPrompt());
+		snippets.clear();
+		guidelines.clear();
 		catalog = new ToolCatalog(cwd);
 		hiddenByThisExtension.clear();
 		lastDescription = undefined;
@@ -282,7 +250,6 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 	pi.on("resources_discover", (_event, context) => {
 		// Pi emits this after all session_start handlers, including providers
 		// that register mode-dependent tools during startup or reload.
-		captureSnippetsFromPrompt(context.getSystemPrompt());
 		refreshCatalog();
 		restoreForContext(context);
 		registerLoader();
@@ -290,60 +257,76 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 	});
 
 	pi.on("before_agent_start", (event, context) => {
-		captureSnippets(event.systemPromptOptions);
+		const options = event.systemPromptOptions;
 		native = supportsIncrementalTools(context.model);
-		standardPrompt = hasStandardToolMetadata(event.systemPrompt);
+		standardPrompt = hasStructuredToolMetadata(options);
 		if (refreshCatalog()) registerLoader();
+		// Invalidate the previous snapshot before accepting this run's metadata,
+		// including authored guideline overrides and explicit empty arrays.
+		snippets = toolSnippets(options);
+		guidelines = toolGuidelines(options);
 		applyMode();
 		if (collision) return;
+		// This is the actual executable loadout, NOT the smaller metadata display set.
+		options.selectedTools = pi.getActiveTools();
 		if (!standardPrompt) {
 			if (enabled && mode === "auto" && !warnedTemplate) {
 				warnedTemplate = true;
-				const message = "pi-tool-search: custom/unrecognized system prompt; using fixed allowed tools. Use Pi's default prompt with append for deferred metadata.";
+				const message = "pi-tool-search: custom/forced prompt or tool-section override; using fixed allowed tools. Use Pi's default structured prompt with append for deferred metadata.";
 				if (context.hasUI) context.ui.notify(message, "warning");
 				else console.warn(message);
 			}
 			return;
 		}
-		const options = event.systemPromptOptions;
-		const systemPrompt = stabilizeToolMetadata(
-			event.systemPrompt,
-			options,
-			catalog.all(),
-			useDeferred(),
-			event.systemPromptOptions,
-		);
-		return systemPrompt === undefined ? undefined : { systemPrompt };
+		stabilizeToolMetadata(options, catalog.all(), useDeferred());
+		const message = pendingGuidance ? guidanceMessage(pendingGuidance) : undefined;
+		cancelGuidanceProjection?.();
+		cancelGuidanceProjection = undefined;
+		pendingGuidance = undefined;
+		return message ? { message } : undefined;
 	});
 
-	pi.on("turn_end", (event) => {
+	pi.on("turn_end", () => {
 		// Pi snapshots the next turn after this hook. Registry refreshes elsewhere
 		// can reactivate the whole explicit allowlist; reassert our subset here.
 		if (refreshCatalog()) registerLoader();
 		applyMode();
-		if (collision || !useDeferred()) return;
-		const corrections = history.recordIncidental(event.toolResults, new Set(catalog.all().map((entry) => entry.tool.name)));
-		if (corrections.length) pi.appendEntry(TOOL_SEARCH_CORRECTIONS_ENTRY, corrections);
 	});
 
-	pi.on("context", (event) => {
-		if (!ownsLoader()) return;
-		const messages = history.sanitize(event.messages);
-		return messages === event.messages ? undefined : { messages };
+	pi.on("session_compact", (event) => {
+		audit.reset();
+		pendingGuidance = event.compactionEntry.id;
+		cancelGuidanceProjection?.();
+		// Idle compaction is handled by before_agent_start. Mid-run compaction
+		// needs guidance on the IMMEDIATE next request, even if steering was
+		// already polled before Pi compacted. A one-shot projection avoids a
+		// history scan and a queued steering message causing an extra model turn.
+		cancelGuidanceProjection = pi.on("context", (contextEvent) => {
+			cancelGuidanceProjection?.();
+			cancelGuidanceProjection = undefined;
+			const message = pendingGuidance ? guidanceMessage(pendingGuidance) : undefined;
+			pendingGuidance = undefined;
+			if (!message) return;
+			// Persist at the safe turn boundary; don't interleave a custom message
+			// with outstanding tool calls/results or trigger another response.
+			pi.sendMessage(message, { triggerTurn: false });
+			return { messages: [...contextEvent.messages, { role: "custom", ...message, timestamp: Date.now() }] };
+		});
 	});
 
-	pi.on("before_provider_request", (event) => {
-		if (auditEnabled) console.warn(`pi-tool-search audit: ${audit.observe(event.payload)}`);
+	pi.on("before_provider_request", (event, context) => {
+		if (auditEnabled) console.warn(`pi-tool-search audit: ${audit.observe(event.payload, context.model?.api)}`);
 	});
 
 	pi.on("model_select", (event) => {
+		audit.reset();
 		native = supportsIncrementalTools(event.model);
 		refreshCatalog();
 		applyMode();
 	});
 
 	pi.on("session_tree", (_event, context) => {
-		captureSnippetsFromPrompt(context.getSystemPrompt());
+		audit.reset();
 		refreshCatalog();
 		restoreForContext(context);
 		registerLoader();
@@ -353,8 +336,11 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 	pi.on("session_shutdown", () => {
 		loaded.clear();
 		snippets.clear();
+		guidelines.clear();
 		hiddenByThisExtension.clear();
-		history.reset();
+		pendingGuidance = undefined;
+		cancelGuidanceProjection?.();
+		cancelGuidanceProjection = undefined;
 		audit.reset();
 	});
 

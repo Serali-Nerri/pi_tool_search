@@ -83,7 +83,7 @@ for (const native of [false, true]) {
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 					contextWindow: 100_000,
 					maxTokens: 1000,
-					...(native ? { compat: { supportsToolSearch: true } } : {}),
+					...(native ? { compat: { supportsMidConvoSystemMessages: true, supportsToolSearch: true } } : {}),
 				},
 			});
 			const errors: unknown[] = [];

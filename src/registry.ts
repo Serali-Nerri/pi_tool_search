@@ -43,11 +43,15 @@ export function toolSourceIdentity(tool: Pick<ToolInfo, "sourceInfo">, cwd = pro
 	const packageName = packagePath.startsWith("@")
 		? packagePath.split("/").slice(0, 2).join("/")
 		: packagePath.split("/")[0];
-	const identity = canonical.replaceAll("\\", "/").includes("/node_modules/") && packageName
-		? `npm:${packageName}`
-		: source === "cli" || source === "local" || source.startsWith(".") || source.startsWith("/")
-			? `file:${canonical}`
-			: source;
+	// All SDK factories share source="inline". Pi's opaque factory path, not
+	// that common tag, identifies the provider across reloads and resumes.
+	const identity = source === "inline"
+		? `inline:${canonical}`
+		: canonical.replaceAll("\\", "/").includes("/node_modules/") && packageName
+			? `npm:${packageName}`
+			: source === "cli" || source === "local" || source.startsWith(".") || source.startsWith("/")
+				? `file:${canonical}`
+				: source;
 	sourceIdentities.set(cacheKey, identity);
 	return identity;
 }
@@ -123,6 +127,15 @@ function defaultPolicy(tool: ToolInfo, initiallyActive: ReadonlySet<string>): To
 	return initiallyActive.has(tool.name) ? "deferred" : "excluded";
 }
 
+function configuredPolicy(tool: ToolInfo, key: string, policies: ReadonlyMap<string, ToolPolicy>): ToolPolicy | undefined {
+	const scoped = policies.get(key);
+	if (scoped !== undefined) return scoped;
+	// Never guess which factory an old generic inline authorization belonged to.
+	// Retain only exclusions, so migrating identity cannot silently enable a tool.
+	return tool.sourceInfo.source === "inline" && policies.get(`inline\u0000${tool.name}`) === "excluded"
+		? "excluded" : undefined;
+}
+
 // Identity tokens keep reassignment of an unserializable field detectable
 // without serializing it: a fresh object gets a fresh token.
 const fallbackTokens = new WeakMap<object, number>();
@@ -195,7 +208,7 @@ export class ToolCatalog {
 			// Preserve the original default, not a former file override. Removing
 			// a record must not leave its effective value stuck in the catalog.
 			const fallbackPolicy = existing?.fallbackPolicy ?? defaultPolicy(tool, initiallyActive);
-			const configured = projectPolicies.get(key) ?? savedPolicies.get(key);
+			const configured = configuredPolicy(tool, key, projectPolicies) ?? configuredPolicy(tool, key, savedPolicies);
 			const policy = protectedTool ? "always" : configured ?? fallbackPolicy;
 			// Reuse the cached signature when nothing it covers changed: the
 			// snapshot holds the previous field references, so any reassigned

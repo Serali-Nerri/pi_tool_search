@@ -4,38 +4,14 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
-import type { ContextEvent, ToolInfo } from "@earendil-works/pi-coding-agent";
+import type { ToolInfo } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { RequestAudit } from "../src/audit.ts";
-import { supportsIncrementalTools } from "../src/capabilities.ts";
 import { loadEffectiveToolSearchPolicies, loadToolSearchPolicies, saveToolSearchPolicies } from "../src/config.ts";
-import { ActivationHistory } from "../src/history.ts";
-import { hasStandardToolMetadata, stabilizeToolMetadata } from "../src/prompt.ts";
-import { PROTECTED_TOOL_NAMES, ToolCatalog, isOwnedBy, normalizeExtensionPath, toolKey, type ToolCatalogEntry } from "../src/registry.ts";
+import { PROTECTED_TOOL_NAMES, ToolCatalog, isOwnedBy, normalizeExtensionPath, toolKey } from "../src/registry.ts";
 
 function tool(name: string, source = "npm:test", path = "/tmp/providers/test/index.ts"): ToolInfo {
 	return { name, description: `${name} description`, parameters: Type.Object({}), promptGuidelines: [`${name} guideline`], sourceInfo: { source, path, scope: "user", origin: "package" } };
 }
-function entry(name: string, policy: ToolCatalogEntry["policy"]): ToolCatalogEntry {
-	const value = tool(name);
-	return { key: toolKey(value), tool: value, policy, protected: false };
-}
-function prompt(tools: string[], guides: string[], tail = "Current project safety instructions") {
-	return `Coding role\n\nAvailable tools:\n${tools.map((name) => `- ${name}: ${name} snippet`).join("\n")}\n\nIn addition to the tools above, custom tools may exist.\n\nGuidelines:\n${guides.map((guide) => `- ${guide}`).join("\n")}\n\nPi documentation (help)\n${tail}`;
-}
-
-test("capabilities use declared resolved-model protocol flags, never model-name guesses", () => {
-	assert.equal(supportsIncrementalTools(undefined), false);
-	assert.equal(supportsIncrementalTools({ api: "openai-responses" }), false);
-	assert.equal(supportsIncrementalTools({ api: "openai-completions", compat: { supportsAdditionalTools: true } }), false);
-	assert.equal(supportsIncrementalTools({ api: "openai-codex-responses", compat: { supportsAdditionalTools: true } }), true);
-	assert.equal(supportsIncrementalTools({ api: "openai-responses", compat: { supportsToolSearch: true } }), true);
-	assert.equal(supportsIncrementalTools({ api: "openai-responses", compat: { supportsToolSearch: "true" } }), false);
-	assert.equal(supportsIncrementalTools({ api: "anthropic-messages", compat: { supportsToolReferences: true } }), true);
-	assert.equal(supportsIncrementalTools({ api: "anthropic-messages" }), false);
-	assert.equal(supportsIncrementalTools({ api: "openai-responses", compat: { supportsToolReferences: true } }), false);
-});
-
 test("locked defaults apply only to registered tools and ignore saved exclusions", () => {
 	const catalog = new ToolCatalog();
 	const tools = [...PROTECTED_TOOL_NAMES].map((name) => tool(name));
@@ -89,6 +65,49 @@ test("npm and explicit child paths share identity, while distinct local provider
 	const path = "/tmp/agent/npm/node_modules/@ff-labs/pi-fff/src/index.ts";
 	assert.equal(toolKey(tool("grep", "npm:@ff-labs/pi-fff", path)), toolKey(tool("grep", "cli", path)));
 	assert.notEqual(toolKey(tool("search", "cli", "/tmp/a.ts")), toolKey(tool("search", "cli", "/tmp/b.ts")));
+});
+
+test("inline identities and saved policies are scoped to the factory path, not the shared source tag", () => {
+	const first = tool("alpha", "inline", "<inline:provider-A>");
+	const second = tool("alpha", "inline", "<inline:provider-B>");
+	const key = toolKey(first, "/first-cwd");
+	assert.equal(key, "inline:<inline:provider-A>\u0000alpha");
+	assert.equal(toolKey(first, "/another-cwd"), key);
+	assert.notEqual(toolKey(second), key);
+	const catalog = new ToolCatalog();
+	const active = new Set(["alpha"]);
+	const saved = new Map([[key, "excluded" as const]]);
+	catalog.refresh([first], active, saved);
+	assert.equal(catalog.byName("alpha")?.policy, "excluded");
+	catalog.refresh([second], active, saved);
+	assert.equal(catalog.byName("alpha")?.policy, "deferred");
+	assert.deepEqual(catalog.policyRecords(new Map([[toolKey(second), "always"]])), [
+		{ name: "alpha", source: "inline:<inline:provider-B>", policy: "always" },
+	]);
+	// An old generic inline policy has no reliable factory provenance.
+	catalog.refresh([first], active, new Map([["inline\u0000alpha", "always"]]));
+	assert.equal(catalog.byName("alpha")?.policy, "deferred");
+});
+
+test("legacy inline exclusions stay closed until an explicit factory-scoped policy overrides them", () => {
+	const first = tool("alpha", "inline", "<inline:provider-A>");
+	const second = tool("alpha", "inline", "<inline:provider-B>");
+	const active = new Set(["alpha"]);
+	const catalog = new ToolCatalog();
+	const legacy = new Map([["inline\u0000alpha", "excluded" as const]]);
+	for (const provider of [first, second]) {
+		catalog.refresh([provider], active, legacy);
+		assert.equal(catalog.byName("alpha")?.policy, "excluded");
+	}
+	const scoped = new Map([[toolKey(first), "deferred" as const]]);
+	catalog.refresh([first], active, new Map([...legacy, ...scoped]));
+	assert.equal(catalog.byName("alpha")?.policy, "deferred");
+	catalog.refresh([second], active, new Map([...legacy, ...scoped]));
+	assert.equal(catalog.byName("alpha")?.policy, "excluded");
+	catalog.refresh([first], active, legacy, scoped);
+	assert.equal(catalog.byName("alpha")?.policy, "deferred", "project-scoped intent overrides global legacy exclusion");
+	catalog.refresh([first], active, scoped, legacy);
+	assert.equal(catalog.byName("alpha")?.policy, "excluded", "project legacy exclusion still outranks global policies");
 });
 
 test("catalog detects schema and prompt-guideline changes even when description is unchanged", () => {
@@ -158,143 +177,6 @@ test("global defaults and trusted project overrides retain precedence", async ()
 		assert.equal(saved.mode, "auto");
 		assert.equal(saved.audit, false);
 	} finally { await rm(root, { recursive: true, force: true }); }
-});
-
-test("stable metadata never injects deferred guidelines into the system prompt", () => {
-	const entries = [entry("read", "always"), entry("alpha", "deferred"), entry("hidden", "excluded")];
-	const options = { cwd: "/tmp", toolSnippets: { read: "read snippet", alpha: "alpha snippet", hidden: "hidden snippet" } };
-	const initial = prompt(["read"], ["read guideline", "Be concise in your responses"]);
-	const after = prompt(["read", "alpha"], ["read guideline", "alpha guideline", "Be concise in your responses"]);
-	const stable = stabilizeToolMetadata(initial, options, entries, true, options)!;
-	// Activation must not rewrite the system prompt: deferred guides travel with
-	// the tool_search result instead (see buildToolGuidance in tool.ts).
-	assert.equal(stable, stabilizeToolMetadata(after, options, entries, true, options));
-	assert.doesNotMatch(stable, /alpha guideline/);
-	assert.doesNotMatch(stable, /- alpha:|hidden/);
-	assert.match(stable, /Current project safety instructions/);
-});
-
-test("multiline guidelines are removed as whole blocks, never leaked or duplicated", () => {
-	const multiline = "Use alpha\n  with context";
-	const alpha = tool("alpha");
-	alpha.promptGuidelines = [multiline];
-	const readEntry: ToolCatalogEntry = { key: toolKey(tool("read")), tool: tool("read"), policy: "always", protected: false };
-	const alphaEntry: ToolCatalogEntry = { key: toolKey(alpha), tool: alpha, policy: "deferred", protected: false };
-	const options = { cwd: "/tmp", toolSnippets: { read: "read snippet", alpha: "alpha snippet" } };
-	// Pi renders a multiline guideline verbatim; the continuation line carries no bullet.
-	const text = prompt(["read", "alpha"], ["read guideline", multiline, "Be concise"]);
-	// Deferred: the whole block must vanish, including its continuation line.
-	const deferred = stabilizeToolMetadata(text, options, [readEntry, alphaEntry], true, options)!;
-	assert.doesNotMatch(deferred, /Use alpha/);
-	assert.doesNotMatch(deferred, /with context/);
-	assert.match(deferred, /Be concise/);
-	// Always: exactly one copy survives the rebuild (stale copy removed, then re-added).
-	const alwaysEntry: ToolCatalogEntry = { ...alphaEntry, policy: "always" };
-	const visible = stabilizeToolMetadata(text, options, [readEntry, alwaysEntry], true, options)!;
-	assert.equal(visible.match(/Use alpha/g)?.length, 1);
-});
-
-test("overlapping and adjacent multiline guidelines are removed longest-first with literal matching", () => {
-	const short = "Use alpha (a+b)? [x].";
-	const long = `${short}\n  with context`;
-	const alpha = tool("alpha");
-	alpha.promptGuidelines = [short, long];
-	const inherited = prompt(["alpha"], [long, long, short, "Keep role safety instructions"]);
-	const options = { cwd: "/tmp", customPrompt: inherited, promptGuidelines: [short] };
-	for (const policy of ["deferred", "always"] as const) {
-		const entries: ToolCatalogEntry[] = [{ key: toolKey(alpha), tool: alpha, policy, protected: false }];
-		const output = stabilizeToolMetadata(inherited, options, entries, true)!;
-		assert.equal(output.split("with context").length - 1, policy === "always" ? 1 : 0);
-		assert.match(output, /Keep role safety instructions/);
-		assert.equal(output, stabilizeToolMetadata(output, options, entries, true));
-	}
-});
-
-test("a known single-line guideline cannot consume an unknown continuation", () => {
-	const alpha = tool("alpha");
-	alpha.promptGuidelines = ["Use alpha"];
-	const entries: ToolCatalogEntry[] = [{ key: toolKey(alpha), tool: alpha, policy: "excluded", protected: false }];
-	const inherited = prompt([], ["Use alpha\n  unknown safety caveat", "Other safety instructions"]);
-	const output = stabilizeToolMetadata(inherited, { cwd: "/tmp" }, entries, true)!;
-	assert.match(output, /- Use alpha\n  unknown safety caveat/);
-	assert.match(output, /Other safety instructions/);
-});
-
-test("changing role and safety text is preserved rather than freezing the system prompt", () => {
-	const entries = [entry("read", "always")];
-	const options = { cwd: "/tmp", toolSnippets: { read: "read snippet" } };
-	const text = prompt(["read"], ["read guideline", "Do not delete files"], "New task: inspect only");
-	const output = stabilizeToolMetadata(text, options, entries, true)!;
-	assert.match(output, /Do not delete files/);
-	assert.match(output, /New task: inspect only/);
-	assert.ok(output.startsWith("Coding role"));
-});
-
-test("custom and ambiguous templates are left untouched", () => {
-	assert.equal(hasStandardToolMetadata("Custom role"), false);
-	assert.equal(hasStandardToolMetadata("Available tools:\nexample"), false);
-	const text = prompt(["read"], []);
-	assert.equal(stabilizeToolMetadata("Custom role", { cwd: "/tmp", customPrompt: "Custom role" }, [], true), undefined);
-	assert.equal(stabilizeToolMetadata(`${text}\n\nAvailable tools:\nexample`, { cwd: "/tmp" }, [], true), undefined);
-});
-
-test("an overridden prompt that carries Pi's blocks is rewritten for its own tool set", () => {
-	// Subagent sessions replace the system prompt but inherit a copy of Pi's
-	// prompt: the inherited tool list must describe the child's own tools.
-	const inherited = prompt(["read", "alpha", "ls", "tool_search"], ["alpha guideline", "Use ls for listings"]);
-	const entries = [entry("read", "always"), entry("alpha", "deferred")];
-	const options = {
-		cwd: "/tmp",
-		customPrompt: inherited,
-		toolSnippets: { read: "read snippet", alpha: "alpha snippet" },
-	};
-	assert.equal(hasStandardToolMetadata(inherited), true);
-	const output = stabilizeToolMetadata(inherited, options, entries, true, options)!;
-	assert.match(output, /- read: read snippet/);
-	assert.doesNotMatch(output, /- alpha:/);
-	assert.doesNotMatch(output, /- ls:/);
-	assert.doesNotMatch(output, /- tool_search:/);
-	assert.doesNotMatch(output, /alpha guideline/);
-	// Guidance that belongs to no known tool is preserved by design: the loader
-	// never guesses which extension owns an unrecognized line.
-	assert.match(output, /Use ls for listings/);
-});
-
-function result(name: string, addedToolNames: string[], details?: unknown): ContextEvent["messages"][number] {
-	return { role: "toolResult", toolCallId: `${name}-1`, toolName: name, content: [], addedToolNames, details, isError: false, timestamp: 0 };
-}
-
-test("loader bookkeeping is repaired from durable intent without mutating transcript messages", () => {
-	const history = new ActivationHistory();
-	const original = result("tool_search", ["alpha", "beta"], { added: ["alpha"], active: ["alpha"] });
-	const cleaned = history.sanitize([original]);
-	assert.deepEqual((cleaned[0] as any).addedToolNames, ["alpha"]);
-	assert.deepEqual((original as any).addedToolNames, ["alpha", "beta"]);
-	assert.equal(history.sanitize([original])[0], cleaned[0]);
-	const legacy = result("tool_search", ["legacy"]);
-	assert.equal(history.sanitize([legacy])[0], legacy);
-});
-
-test("incidental activation corrections survive restore and preserve unrelated additions", () => {
-	const history = new ActivationHistory();
-	const message = result("alpha", ["beta", "foreign"]) as any;
-	const saved = history.recordIncidental([message], new Set(["beta"]));
-	assert.deepEqual((history.sanitize([message])[0] as any).addedToolNames, ["foreign"]);
-	history.reset();
-	history.restore(saved);
-	assert.deepEqual((history.sanitize([message])[0] as any).addedToolNames, ["foreign"]);
-});
-
-test("request audit fingerprints stable prefix sections and historical inline positions", () => {
-	const audit = new RequestAudit();
-	const payload = { instructions: "Role", tools: [{ name: "read" }], input: [{ role: "user", content: "task" }] };
-	assert.match(audit.observe(payload), /baseline/);
-	const loaded = { ...payload, input: [...payload.input, { type: "additional_tools", role: "developer", tools: [{ name: "alpha" }] }] };
-	assert.match(audit.observe(loaded), /stable/);
-	assert.match(audit.observe({ ...loaded, input: [...loaded.input, { role: "user", content: "next" }] }), /stable/);
-	assert.match(audit.observe({ ...loaded, tools: [{ name: "different" }] }), /top-level tools changed/);
-	assert.match(audit.observe({ ...loaded, input: [...payload.input, ...loaded.input] }), /historical inline definitions changed/);
-	assert.doesNotMatch(audit.status(), /"Role"|"task"/);
 });
 
 test("catalog tolerates unserializable tool schemas without breaking refresh", () => {
@@ -411,13 +293,4 @@ test("policy records carrying NUL bytes are ignored on load", async () => {
 	} finally {
 		await rm(cwd, { recursive: true, force: true });
 	}
-});
-
-test("tool snippets ignore inherited object properties", () => {
-	const catalog = new ToolCatalog();
-	const ctor = tool("constructor");
-	catalog.refresh([ctor], new Set(["constructor"]), new Map());
-	const text = prompt(["constructor"], []);
-	const rewritten = stabilizeToolMetadata(text, { cwd: "/tmp", toolSnippets: {} }, catalog.all(), false);
-	assert.ok(rewritten && !rewritten.includes("- constructor:"));
 });

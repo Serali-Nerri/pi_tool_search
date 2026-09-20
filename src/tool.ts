@@ -10,11 +10,13 @@ export const TOOL_GUIDANCE_MAX_BYTES = 8 * 1024;
 
 export interface ToolSearchResultDetails {
 	matches: string[];
+	/** First authorized loads or reactivations, not Pi's provider-level tool delta. */
 	added: string[];
 	active?: string[];
 	loadedKeys?: string[];
 	unknown: string[];
 	collision?: boolean;
+	disabled?: boolean;
 }
 
 const toolSearchParameters = Type.Object(
@@ -58,9 +60,9 @@ function joinedNames(names: readonly string[], fallback = "deferred tools"): str
 /**
  * Guidance for tools the model just activated.
  *
- * Pi's getAllTools() omits promptSnippet and hides deferred tools from
- * before_agent_start options, so snippets are captured while the tools were
- * still active (see captureSnippets in lifecycle.ts). When a snippet is known it
+ * Pi 0.86's before_agent_start options include snippets for inactive tools.
+ * The lifecycle reads those structured inputs without parsing prompt text.
+ * When a snippet is known it
  * labels the tool; otherwise the bounded rendered description stands in.
  * Whitespace is collapsed so a multiline guideline cannot masquerade as extra
  * bullets, and repeated guidance is emitted once per activation batch. The
@@ -68,8 +70,10 @@ function joinedNames(names: readonly string[], fallback = "deferred tools"): str
  * byte-stable.
  */
 export interface ToolGuidanceOptions {
-	/** Prompt snippets captured while the tools were still active, keyed by tool name. */
+	/** Structured prompt snippets keyed by tool name. */
 	snippets?: ReadonlyMap<string, string>;
+	/** Structured overrides, including explicit empty arrays, win over registered guidelines. */
+	guidelines?: ReadonlyMap<string, readonly string[]>;
 	maxBytes?: number;
 }
 
@@ -92,7 +96,7 @@ export function buildToolGuidance(
 		if (usedBytes + headingBytes > maxBytes) continue;
 		lines.push(heading);
 		usedBytes += headingBytes;
-		for (const raw of entry.tool.promptGuidelines ?? []) {
+		for (const raw of options.guidelines?.get(name) ?? entry.tool.promptGuidelines ?? []) {
 			const guide = raw.replace(/\s+/g, " ").trim();
 			if (!guide || seen.has(guide)) continue;
 			const line = `  - ${guide}`;
@@ -119,7 +123,7 @@ function completedToolSearchStatus(
 ): { marker: "error" | "success" | "warning"; text: string; names?: string; tail?: string } {
 	const details = result?.details;
 	const output = resultText(result);
-	if (isError || details?.collision || /(?:disabled|unavailable)/i.test(output)) {
+	if (isError || details?.collision || details?.disabled) {
 		return { marker: "error", text: output.split("\n")[0] || "Tool search failed" };
 	}
 
@@ -245,8 +249,9 @@ interface ToolSearchDefinitionOptions {
 	enabled: () => boolean;
 	owned: () => boolean;
 	activate: (names: string[]) => { added: string[]; active: string[] };
-	/** Prompt snippets captured while the tools were still active. */
+	/** Snippets from the current structured prompt inputs. */
 	snippets?: () => ReadonlyMap<string, string>;
+	guidelines?: () => ReadonlyMap<string, readonly string[]>;
 }
 
 function editDistance(left: string, right: string): number {
@@ -326,7 +331,7 @@ export function createToolSearchDefinition(
 			if (!options.enabled()) {
 				return {
 					content: [{ type: "text", text: "Tool search mode is disabled. Use /tool-search on." }],
-					details: { matches: [], added: [], unknown: [] },
+					details: { matches: [], added: [], unknown: [], disabled: true },
 				};
 			}
 			if (!options.owned()) {
@@ -361,7 +366,7 @@ export function createToolSearchDefinition(
 						: `Unknown deferred tool: ${name}.`,
 				);
 			}
-			const guidance = buildToolGuidance(added, byName, { snippets: options.snippets?.() });
+			const guidance = buildToolGuidance(added, byName, { snippets: options.snippets?.(), guidelines: options.guidelines?.() });
 			if (guidance) lines.push("", guidance);
 			return {
 				content: [{ type: "text", text: lines.join("\n") || "No deferred tools were loaded." }],

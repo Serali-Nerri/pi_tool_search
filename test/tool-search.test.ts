@@ -53,6 +53,16 @@ test("short descriptions sanitize markdown and stay within the UTF-8 budget", ()
 	assert.match(short, /^解析_document。/);
 });
 
+test("short descriptions preserve abbreviations and respect even tiny byte budgets", () => {
+	for (const text of ["Search the web (e.g. news) quickly.", "Read a file, e.g. /tmp/x.", "Uses version 1.2. beta"]) {
+		assert.equal(shortToolDescription(text), text);
+	}
+	for (const maxBytes of [0, 1, 2, 3, 4, 10]) {
+		assert.ok(Buffer.byteLength(shortToolDescription("界".repeat(100), maxBytes)) <= maxBytes);
+		assert.ok(Buffer.byteLength(shortToolDescription(undefined, maxBytes)) <= maxBytes);
+	}
+});
+
 test("missing or empty descriptions never break the manifest", () => {
 	assert.equal(shortToolDescription(undefined), "No description provided");
 	assert.equal(shortToolDescription(null), "No description provided");
@@ -116,6 +126,15 @@ test("tool guidance prefers a captured prompt snippet over the description", () 
 	);
 	assert.match(buildToolGuidance(["alpha"], byName), /- alpha: alpha description/);
 	assert.match(buildToolGuidance(["alpha"], byName, { snippets: new Map([["alpha", "   "]]) }), /- alpha: alpha description/);
+});
+
+test("structured per-tool guideline overrides, including empty arrays, win over registered guidance", () => {
+	const entry: ToolCatalogEntry = { key: "src\u0000alpha", tool: { ...tool("alpha", "src"), promptGuidelines: ["Registered guide"] }, policy: "deferred", protected: false };
+	const entries = new Map([["alpha", entry]]);
+	const overridden = buildToolGuidance(["alpha"], entries, { guidelines: new Map([["alpha", ["Structured guide"]]]) });
+	assert.match(overridden, /Structured guide/);
+	assert.doesNotMatch(overridden, /Registered guide/);
+	assert.doesNotMatch(buildToolGuidance(["alpha"], entries, { guidelines: new Map([["alpha", []]]) }), /Registered guide/);
 });
 
 test("tool guidance stays within the UTF-8 budget", () => {
