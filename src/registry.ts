@@ -49,7 +49,7 @@ export function toolSourceIdentity(tool: Pick<ToolInfo, "sourceInfo">, cwd = pro
 		? `inline:${canonical}`
 		: canonical.replaceAll("\\", "/").includes("/node_modules/") && packageName
 			? `npm:${packageName}`
-			: source === "cli" || source === "local" || source.startsWith(".") || source.startsWith("/")
+			: source === "auto" || source === "cli" || source === "local" || source.startsWith(".") || source.startsWith("/")
 				? `file:${canonical}`
 				: source;
 	sourceIdentities.set(cacheKey, identity);
@@ -130,9 +130,11 @@ function defaultPolicy(tool: ToolInfo, initiallyActive: ReadonlySet<string>): To
 function configuredPolicy(tool: ToolInfo, key: string, policies: ReadonlyMap<string, ToolPolicy>): ToolPolicy | undefined {
 	const scoped = policies.get(key);
 	if (scoped !== undefined) return scoped;
-	// Never guess which factory an old generic inline authorization belonged to.
-	// Retain only exclusions, so migrating identity cannot silently enable a tool.
-	return tool.sourceInfo.source === "inline" && policies.get(`inline\u0000${tool.name}`) === "excluded"
+	// Generic inline/auto records cannot identify a provider. Retain only
+	// exclusions, so moving to scoped identities cannot silently enable a tool.
+	const source = tool.sourceInfo.source;
+	const legacy = source === "inline" || (source === "auto" && key.startsWith("file:"));
+	return legacy && policies.get(policyRecordKey({ source, name: tool.name })) === "excluded"
 		? "excluded" : undefined;
 }
 

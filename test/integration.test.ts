@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test, { after } from "node:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { BuildSystemPromptOptions, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { registerToolSearch } from "../src/index.ts";
@@ -583,7 +583,21 @@ for (const api of ["openai-responses", "openai-completions", "anthropic-messages
 		assert.equal(harness.getActiveTools().includes("web_search"), false);
 		assert.equal(harness.getActiveTools().includes("tool_search"), true);
 		const loader = harness.tool("tool_search");
-		const metadata = await harness.emitAsync("before_agent_start", {}, context);
+		const promptOptions = (): BuildSystemPromptOptions => ({
+			cwd: testRoot,
+			toolSnippets: {
+				read: "Read files", tool_search: loader.promptSnippet!,
+				web_search: "Search the web", document_parse: "Parse documents", late_tool: "Late",
+			},
+			toolGuidelines: { read: ["Use read before editing files."], web_search: ["Use web_search carefully."] },
+		});
+		const before = promptOptions();
+		await harness.emitAsync("before_agent_start", { systemPromptOptions: before }, context);
+		assert.match(before.sections?.tools ?? "", /- read: Read files/);
+		assert.match(before.sections?.tools ?? "", /- tool_search:/);
+		assert.match(before.sections?.rules ?? "", /Use read before editing files/);
+		assert.doesNotMatch(JSON.stringify(before.sections), /web_search|document_parse|late_tool/);
+		const metadata = structuredClone(before.sections);
 		await loader.execute!("load", { tool_names: ["web_search"] });
 		harness.addExternalTool({ name: "late_tool", description: "Late", source: "npm:late" });
 		await harness.emitAsync("turn_end", { toolResults: [] }, context);
@@ -592,7 +606,11 @@ for (const api of ["openai-responses", "openai-completions", "anthropic-messages
 		assert.equal(harness.getActiveTools().includes("late_tool"), false);
 		const repeated = await harness.tool("tool_search").execute!("again", { tool_names: ["web_search"] });
 		assert.deepEqual(repeated.details.added, []);
-		assert.deepEqual(await harness.emitAsync("before_agent_start", {}, context), metadata);
+		const after = promptOptions();
+		await harness.emitAsync("before_agent_start", { systemPromptOptions: after }, context);
+		assert.deepEqual(after.sections, metadata);
+		assert.ok(after.selectedTools?.includes("web_search"));
+		assert.ok(!after.selectedTools?.includes("late_tool"));
 	});
 }
 
@@ -663,6 +681,34 @@ test("child policy is loaded from ctx.cwd rather than the factory process cwd", 
 	await harness.emitAsync("session_start", {}, { ...extensionContext(), cwd });
 	assert.doesNotMatch(harness.tool("tool_search").description, /web_search/);
 	assert.match(harness.tool("tool_search").description, /document_parse/);
+});
+
+test("auto-discovered local activation restores only for the same provider path", async () => {
+	const first = { name: "alpha", description: "Local alpha", source: "auto", path: join(testRoot, "provider-a/index.ts") };
+	const replacement = { ...first, path: join(testRoot, "provider-b/index.ts") };
+	const original = await startHarness({ externalTools: [...externalTools, first] });
+	const result = await original.tool("tool_search").execute!("load-local", { tool_names: ["alpha"] });
+	assert.deepEqual(result.details.loadedKeys, [`file:${first.path}\u0000alpha`]);
+	const entries = [{
+		type: "message", message: {
+			...result, role: "toolResult", toolName: "tool_search", toolCallId: "load-local", isError: false,
+		},
+	}];
+	for (const provider of [first, replacement]) {
+		const resumed = createHarness({ externalTools: [...externalTools, provider] });
+		await resumed.emitAsync("session_start", { reason: "resume" }, extensionContext(entries));
+		assert.equal(resumed.getActiveTools().includes("alpha"), provider === first);
+	}
+	original.addExternalTool(replacement);
+	await original.emitAsync("turn_end", { toolResults: [] }, extensionContext());
+	assert.ok(!original.getActiveTools().includes("alpha"));
+	const reloaded = await original.tool("tool_search").execute!("load-replacement", { tool_names: ["alpha"] });
+	assert.deepEqual(reloaded.details.loadedKeys, [`file:${replacement.path}\u0000alpha`]);
+	// Old generic keys cannot identify a provider; do not fall back to active names.
+	entries[0].message.details = { ...result.details, loadedKeys: ["auto\u0000alpha"] };
+	const legacy = createHarness({ externalTools: [...externalTools, first] });
+	await legacy.emitAsync("session_start", { reason: "resume" }, extensionContext(entries));
+	assert.ok(!legacy.getActiveTools().includes("alpha"));
 });
 
 test("a replacement provider does not inherit an earlier provider's activation", async () => {

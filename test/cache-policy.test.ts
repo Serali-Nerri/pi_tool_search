@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
 import type { ToolInfo } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { loadEffectiveToolSearchPolicies, loadToolSearchPolicies, saveToolSearchPolicies } from "../src/config.ts";
-import { PROTECTED_TOOL_NAMES, ToolCatalog, isOwnedBy, normalizeExtensionPath, toolKey } from "../src/registry.ts";
+import { PROTECTED_TOOL_NAMES, ToolCatalog, isOwnedBy, normalizeExtensionPath, policyRecordKey, toolKey } from "../src/registry.ts";
 
 function tool(name: string, source = "npm:test", path = "/tmp/providers/test/index.ts"): ToolInfo {
 	return { name, description: `${name} description`, parameters: Type.Object({}), promptGuidelines: [`${name} guideline`], sourceInfo: { source, path, scope: "user", origin: "package" } };
@@ -63,8 +63,55 @@ test("ordinary tools follow the generic defaults and never lock", () => {
 
 test("npm and explicit child paths share identity, while distinct local providers do not", () => {
 	const path = "/tmp/agent/npm/node_modules/@ff-labs/pi-fff/src/index.ts";
-	assert.equal(toolKey(tool("grep", "npm:@ff-labs/pi-fff", path)), toolKey(tool("grep", "cli", path)));
+	for (const source of ["cli", "auto"]) {
+		assert.equal(toolKey(tool("grep", "npm:@ff-labs/pi-fff", path)), toolKey(tool("grep", source, path)));
+	}
 	assert.notEqual(toolKey(tool("search", "cli", "/tmp/a.ts")), toolKey(tool("search", "cli", "/tmp/b.ts")));
+});
+
+test("auto-discovered local providers have path-scoped identities and policies", () => {
+	const first = tool("alpha", "auto", "/tmp/project-a/.pi/extensions/search/index.ts");
+	const second = tool("alpha", "auto", "/tmp/project-b/.pi/extensions/search/index.ts");
+	const key = toolKey(first);
+	assert.equal(key, `file:${first.sourceInfo.path}\u0000alpha`);
+	assert.equal(key, toolKey(tool("alpha", "cli", first.sourceInfo.path)));
+	assert.notEqual(toolKey(second), key);
+	const catalog = new ToolCatalog();
+	for (const policy of ["always", "excluded"] as const) {
+		const saved = new Map([[key, policy]]);
+		catalog.refresh([first], new Set(["alpha"]), saved);
+		assert.equal(catalog.byName("alpha")?.policy, policy);
+		catalog.refresh([second], new Set(["alpha"]), saved);
+		assert.equal(catalog.byName("alpha")?.policy, "deferred");
+		assert.equal(catalog.byKey(key), undefined);
+	}
+	assert.deepEqual(catalog.policyRecords(new Map([[toolKey(second), "always"]])), [
+		{ name: "alpha", source: `file:${second.sourceInfo.path}`, policy: "always" },
+	]);
+});
+
+test("legacy auto policies retain only exclusions until a path-scoped override is saved", () => {
+	const first = tool("alpha", "auto", "/tmp/auto-a/index.ts");
+	const second = tool("alpha", "auto", "/tmp/auto-b/index.ts");
+	const legacyKey = policyRecordKey({ name: "alpha", source: "auto" });
+	const catalog = new ToolCatalog();
+	for (const policy of ["always", "deferred", "excluded"] as const) {
+		for (const provider of [first, second]) {
+			catalog.refresh([provider], new Set(["alpha"]), new Map([[legacyKey, policy]]));
+			assert.equal(catalog.byName("alpha")?.policy, policy === "excluded" ? "excluded" : "deferred");
+		}
+	}
+	const legacy = new Map([[legacyKey, "excluded" as const]]);
+	const scoped = new Map([[toolKey(first), "always" as const]]);
+	catalog.refresh([first], new Set(["alpha"]), new Map([...legacy, ...scoped]));
+	assert.equal(catalog.byName("alpha")?.policy, "always");
+	catalog.refresh([first], new Set(["alpha"]), legacy, scoped);
+	assert.equal(catalog.byName("alpha")?.policy, "always");
+	catalog.refresh([first], new Set(["alpha"]), scoped, legacy);
+	assert.equal(catalog.byName("alpha")?.policy, "excluded");
+	// Auto-discovered npm providers already had package-scoped identities.
+	catalog.refresh([tool("alpha", "auto", "/tmp/node_modules/fixture/index.ts")], new Set(["alpha"]), legacy);
+	assert.equal(catalog.byName("alpha")?.policy, "deferred");
 });
 
 test("inline identities and saved policies are scoped to the factory path, not the shared source tag", () => {
@@ -244,6 +291,7 @@ test("symlinked provider paths share ownership and policy identity with their re
 		const real = tool("tool_search", "cli", join(provider, "index.ts"));
 		assert.equal(isOwnedBy(linked, real.sourceInfo.path, cwd), true);
 		assert.equal(toolKey(linked, cwd), toolKey(real));
+		assert.equal(toolKey(tool("tool_search", "auto", "./linked/index.ts"), cwd), toolKey(real));
 	} finally {
 		await rm(cwd, { recursive: true, force: true });
 	}

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { Type } from "typebox";
 import { getCurrentSystemPrompt, getCurrentTools, type TranscriptContext } from "@earendil-works/pi-ai";
 import { activationDetails, TOOL_SEARCH_STATE_ENTRY } from "../src/history.ts";
 import { toolKey } from "../src/registry.ts";
@@ -92,6 +93,38 @@ for (const native of [true, false]) {
 		} finally { await f.cleanup(); }
 	});
 }
+
+test("SDK model-select registration refreshes the loader manifest without exposing unloaded tools", async () => {
+	const f = await sdkFixture({
+		tools: ["tool_search", "alpha", "beta", "model_tool"],
+		beforeLoader: (pi) => {
+			pi.on("model_select", (event) => {
+				if (event.model.id !== "fixture-switched") return;
+				pi.registerTool({
+					name: "model_tool", label: "Model tool", description: "Model-specific capability", parameters: Type.Object({}),
+					async execute() { return { content: [{ type: "text", text: "model tool executed" }], details: {} }; },
+				});
+			});
+		},
+	});
+	try {
+		f.responses.push([toolCall("tool_search", { tool_names: ["alpha"] })]);
+		await f.session.prompt("load alpha before switching models");
+		assert.doesNotMatch(f.session.getToolDefinition("tool_search")!.description, /model_tool/);
+		await f.session.setModel({ ...fixtureModel(), id: "fixture-switched" });
+		assert.match(f.session.getToolDefinition("tool_search")!.description, /model_tool — Model-specific capability/);
+		assert.deepEqual(new Set(f.session.getActiveToolNames()), new Set(["tool_search", "alpha"]));
+		await f.session.prompt("inspect the new manifest without loading anything");
+		const tools = getCurrentTools(f.requests.at(-1)!.messages);
+		assert.match(tools.find((tool) => tool.name === "tool_search")!.description, /model_tool — Model-specific capability/);
+		assert.deepEqual(new Set(tools.map((tool) => tool.name)), new Set(["tool_search", "alpha"]));
+		f.responses.push([toolCall("tool_search", { tool_names: ["model_tool"] })], [toolCall("model_tool")]);
+		await f.session.prompt("load and execute the model-specific tool");
+		assert.ok(f.session.messages.some((message) => message.role === "toolResult" && message.toolName === "model_tool" && !message.isError));
+		assert.ok(!names(f.requests.at(-1)!).includes("beta"));
+		assert.deepEqual(f.errors, []);
+	} finally { await f.cleanup(); }
+});
 
 test("SDK fresh structured snippets survive idle tool-definition changes", async () => {
 	const f = await sdkFixture();

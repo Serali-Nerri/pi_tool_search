@@ -324,7 +324,7 @@ export function registerToolSearch(pi: ExtensionAPI, cwd: string, extensionPath:
 	pi.on("model_select", (event) => {
 		audit.reset();
 		native = supportsIncrementalTools(event.model);
-		refreshCatalog();
+		if (refreshCatalog()) registerLoader();
 		applyMode();
 	});
 
